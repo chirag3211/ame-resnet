@@ -8,14 +8,21 @@ IN=${1:-build/resnet18.mlir}
 OUT=${2:-build/resnet18_llvm.mlir}
 OPT=${MLIR_OPT:-mlir-opt}
 
-echo "[1/4] conv -> img2col + matmul, specialize generics back to named ops"
-$OPT "$IN" \
-  --transform-preload-library="transform-library-paths=mlir/conv_to_matmul.mlir" \
-  --transform-interpreter \
-  --canonicalize \
-  --linalg-fold-unit-extent-dims --canonicalize \
-  --linalg-specialize-generic-ops \
-  -o build/r18_1_matmul.mlir
+echo "[1/4] conv -> gather + matmul"
+if [ "${CONV_REWRITE:-1}" = 1 ]; then
+  python3 mlir/conv_rewrite.py "$IN" build/resnet18_rw.mlir
+  $OPT build/resnet18_rw.mlir --canonicalize \
+    --linalg-fold-unit-extent-dims --canonicalize \
+    --linalg-specialize-generic-ops -o build/r18_1_matmul.mlir
+else
+  $OPT "$IN" \
+    --transform-preload-library="transform-library-paths=mlir/conv_to_matmul.mlir" \
+    --transform-interpreter \
+    --canonicalize \
+    --linalg-fold-unit-extent-dims --canonicalize \
+    --linalg-specialize-generic-ops \
+    -o build/r18_1_matmul.mlir
+fi
 
 echo "[2/4] bufferize"
 $OPT build/r18_1_matmul.mlir \

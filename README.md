@@ -53,6 +53,11 @@ make B=build_vit12p USE_AME=1 SPIKE=$HOME/riscv-stc/bin/spike SPIKE_ISA=rv64imaf
 (1x3x224x224 f32) -> (1x1000 f32) `forward`. SIZE must match the exported input.
 Full ViT-B/16: ~661 MB MLIR (weights inlined), ~44 min for the whole `make` (hypothesis: mostly toolchain, not Spike).
 
+## Generic models (Whisper etc.)
+`python/export_whisper.py`, `python/ame_export.py` (shared: pre-transposed Linear, export), `python/gen_driver.py` (driver for a single-input/single-output model),
+`python/compare_tensor.py` (sampled + checksum comparison). Build with `make B=<dir> DRIVER=<dir>/main_gen.c COMPARE=python/compare_tensor.py ...` (see STATE.md).
+`conv_rewrite.py` handles conv_2d_nchw_fchw and conv_1d_ncw_fcw.
+
 ## Measuring
 `main_resnet.c` runs `forward` twice. RUN0 is cold (includes ~65M instr of one-time pk first-touch
 at 64x64) and RUN1 is warm; **report RUN1 only**. It prints forward / in_matmul / in_copy

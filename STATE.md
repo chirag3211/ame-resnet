@@ -12,6 +12,9 @@ Models so far: ResNet18 (224 and 64), ViT-B/16 (2-layer and full 12-layer). Labe
 ResNet18: `python3 python/export_resnet18.py --size N`
 ViT:      `python3 python/export_vit.py L [OUTDIR] [--orig]` -> build_vitLp/ (default: pre-transposed weights + custom attention, checked against torchvision; max diff 1.7e-6) or build_vitL/ with --orig (plain torchvision; the 858.33M / 4953.64M numbers). Head is randomized (torchvision zero-inits it -> all logits 0).
           then `ln -sf vit.mlir <OUTDIR>/resnet18.mlir` (the Makefile still uses the name resnet18.*)
+Generic model (any single f32 input/output): exporter writes <dir>/{model.mlir, resnet18.mlir(symlink), input.bin, golden_logits.bin, model.json, main_gen.c}; build with
+  make B=<dir> DRIVER=<dir>/main_gen.c COMPARE=python/compare_tensor.py LLVM_OPT=O3 USE_AME=1 SPIKE=... SPIKE_ISA=... resnet-spike
+  main_gen.c runs forward RUNS times (default 2; `python3 python/gen_driver.py <dir>/model.json <dir>/main_gen.c 1` for one cold run). compare_tensor.py checks 2048 sampled outputs + sum of squares + a position-weighted checksum (catches single-element errors >= ~0.5; not exact).
 AME:    make [B=<dir>] USE_AME=1 SPIKE=$HOME/riscv-stc/bin/spike SPIKE_ISA=rv64imafdcv_zicntr_matrix resnet-spike SIZE=N
 Scalar: make [B=<dir>] SPIKE_ISA=rv64gc_zicntr resnet-spike SIZE=N
 - B=<dir> keeps models apart (lower_resnet.sh writes its intermediates next to the output file). SIZE must match the exported input (224 for ViT). A SIZE/model mismatch reads past the input buffer and FAILs (seen once).
@@ -23,7 +26,7 @@ Scalar: make [B=<dir>] SPIKE_ISA=rv64gc_zicntr resnet-spike SIZE=N
 - input.o: objcopy runs inside $(B), symbol is _binary_input_bin_start (path-independent).
 
 ## Design
-Per model: torch-mlir linalg-on-tensors -> mlir/conv_rewrite.py (conv_2d_nchw_fchw -> 5D gather generic + collapse + linalg.matmul + expand; no div/mod; N=1, f32, dilation 1, no groups) -> fold unit dims
+Per model: torch-mlir linalg-on-tensors -> mlir/conv_rewrite.py (conv_2d_nchw_fchw and conv_1d_ncw_fcw -> gather generic + collapse + linalg.matmul + expand; no div/mod; N=1, f32, dilation 1, no groups) -> fold unit dims
 -> rank-2 linalg.matmul and rank-3 linalg.batch_matmul -> bufferize -> matmul_to_call.py -> external ame_mm_f32_N / ame_bmm_f32_N
 -> LLVM (math.erf via --convert-math-to-libm -> erff) -> RV64 object; gen_shims.py shims -> ame_matmul_f32 (src/ame_dispatch.c) -> ame_hw.c (real matrix insns) or ref_matmul.c.
 ame_bmm_f32 (src/memref_shims.c) loops over the batch and calls ame_matmul_f32 once per batch element (so STATS counts one call per head).
@@ -105,6 +108,30 @@ AME 224 shares (derived): memrefCopy 40.2%, matmul 36.2%, everything else 23.6%.
 AME 224 forward vs the original built-in-img2col run: 1607.2M -> 558.98M (2.88x lower).
 memrefCopy is compiled by gcc, so LLVM O3 does not touch it; ~123 instr per element (derived: 224.5M / ~1.83M floats in the 18 pads).
 
+## Profile after O3 + counters off + run-based copy (histogram halved for per-run; all derived from measured counts)
+ResNet18 224 AME: matmul 202.51M (= in_matmul), forward loops ~129.5M, memcpy ~37.4M (the copy cost), memset ~2.5M. Top 8 loop blocks = ~39.6M/run (30.6% of loops); largest block ~7.3M/run (<2% of forward).
+ViT 2-layer AME: matmul 337.87M, forward loops ~134.1M, erff ~50.6M, expf ~36.8M, memset+memcpy ~2.7M (sum of non-matmul 224.3M = measured). erff+expf = 39% of non-matmul, 15.6% of forward. Top 8 loop blocks ~40.7M/run (30% of loops); largest ~7.2M/run.
+Conclusion: flat tail, no dominant loop left. Options (none measured): V-extension vectorization of elementwise loops (needs the scalar baseline compiled identically to stay fair), elementwise fusion, custom erf/exp kernels (changes numerics slightly; ~40 instr/call now).
+Next phase = coverage. Blocker for models above ~100M params: weights inlined as MLIR text (7.6 bytes/param; ViT-B 661 MB, 6.15 GB RSS). Plan: export weights as function arguments, load from a binary file at run time (pk file I/O unverified), generate the driver.
+
+### Whisper-tiny ENCODER, 30 s (1x80x3000 -> 1x1500x384), AME, LLVM_OPT=O3, counters off, random weights, pre-transposed Linears (warm RUN1, measured)
+forward 7848.19M; in_matmul 2052.39M (26.2%); in_copy 18.13M; everything else 5777.67M (73.6%, derived). 74 matmul calls, 18,468,864,000 MACs (matches hand count: 2 convs + 24 Linear + 48 attention [12/layer]). 2 conv_1d rewritten; max abs err (sampled) 1.8e-6, projection err 1.1e-7, PASS. Matmul 0.1111 instr/MAC.
+Hypothesis (not profiled): softmax expf ~2.2G (54M scores x ~40), GELU erff ~0.4G, remaining loops ~3.2G.
+Spike wall time: >=19 min for 2 runs (~16G instr, RUN0 not recorded) -> <=~14M instr/s for the matrix-enabled Spike vs ~70M instr/s measured for scalar stock Spike (hypothesis: matrix Spike is several times slower). pk reads host files (verified, both Spikes).
+Export: `python3 python/export_whisper.py tiny [--frames N] [--orig]` -> build_whisper_tiny_enc[N]p/ (random weights; config sizes for base/small/large-v3-turbo are from memory, check vs model cards). Pre-transposition verified in IR: 17 linalg.transpose left, 0 of constants.
+Estimated (hand count, not run): Whisper-small encoder ~172G MACs (~9x tiny), i.e. hours per run at the observed Spike speed -> use RUNS=1 and/or reduced layers.
+
+### Whisper-tiny DECODER STEP (1 new token, 32 cached tokens, 1500 encoder frames; logits 1x1x51865), AME, O3, counters off (warm RUN1, measured)
+forward 34.09M; in_matmul 29.09M (85.3%); in_copy 0.80M (16 cache concats); everything else 4.20M (12.3%, derived). 129 matmul calls, 32,883,072 MACs (hand count exact: 33 matmuls + 96 attention [24/layer]). Step vs HF full-sequence decoder 1.5e-6; output err 1.3e-6; PASS.
+Matmul 0.885 instr/MAC = 7.96x the encoder's 0.111 (M=1 uses 1 of 8 tile rows; hypothesis from tile geometry, consistent with the ~8x). Vocabulary projection = 19.9M of 32.9M MACs (~60%).
+RUN0 176.0M vs RUN1 34.1M: 142M first-touch of the 385 MB of constants (mostly inside in_matmul). Scalar (measured, same config): forward 235.59M, in_matmul 230.59M (7.01 instr/MAC), in_copy 0.80M, everything else 4.20M (identical to AME). Ratios (derived): whole-forward 6.9x, matmul-only 7.9x (vs 34.6x / 63x for ResNet18 224).
+Model: python/export_whisper_dec.py (custom step module; K caches stored transposed [H,hd,T]; checked vs HF decoder before export). HF's own decoder export produced tensor.scan/tensor.concat (not handled), so the custom module is used.
+Idea (not done): matrix-vector role swap (weights on the 8-row side) would raise best case from 16 to 32 MACs/K-step (~2x), needs a suitable transposed tile load (spec not checked).
+
+### Weights as function arguments (implemented; verified on the Whisper-tiny decoder step)
+`--weights-as-args` on export_whisper.py / export_whisper_dec.py: parameters+buffers become trailing function args (torch.func.functional_call), written to <dir>/weights.bin (64B-aligned), IR has no weight constants. gen_driver.py loads weights.bin at run time with fopen/fread (pk reads host files: verified with a probe on both Spikes); run Spike from the repo root; raise SPIKE_MEM for big weights (make ... SPIKE_MEM=4096). Verified on the decoder step: model.mlir 385 MB -> 117 KB, weights.bin 189 MB (102 weight args), PASS with identical errors; AME RUN1 forward 34,143,861 (inline: 34,085,757, +0.17%, all in non-matmul, cause not isolated; in_matmul and in_copy identical). RUN0-RUN1 gap fell from 142M to 0.80M (first-touch moves into fread before timing), so RUNS=1 is accurate to ~2% for big models.
+Size estimates (derived from 8 bytes/param of inline MLIR): Whisper-small decoder ~1.4 GB, large-v3-turbo decoder ~1.9 GB, large-v3-turbo encoder ~3.2 GB of MLIR text -> need this path.
+
 ## Do not use
 Earlier figures 6.6x, 16.2x, 0.489 instr/MAC for ResNet18 AME (cold-start inflated). The warm 16.37x/16.78x above is a different, valid measurement.
 9.19x / 8.80x are valid but pre-rewrite.
@@ -119,7 +146,7 @@ Earlier figures 6.6x, 16.2x, 0.489 instr/MAC for ResNet18 AME (cold-start inflat
 5. Matmul tuning (hoist msettilek, multi-accumulator): matmul is 31-48% of forward; K-step = 17 instr (incl. 3 counter instr), ~126 of 128 MACs.
 6. Decode steps are matrix-vector (M=1): an 8-row tile would use ~1/8 of the unit (hypothesis); may need a different mapping.
 7. int8 (mqma.b.mm) needs a quantized model; needed to fit the large LLMs in RAM.
-8. conv_rewrite.py gaps: groups/depthwise, conv1d, transposed conv, dilation, N>1 (needed for Whisper/Moonshine/Canary/Kokoro/Mamba).
+8. conv_rewrite.py gaps: groups/depthwise, transposed conv, dilation, N>1 (conv1d done) (needed for Whisper/Moonshine/Canary/Kokoro/Mamba).
 9. Target is the riscv-stc v0.5 matrix extension, not the task-group Zvame draft.
 
 ## Profile findings (ViT 2-layer, original export, hist covers RUN0+RUN1+pk, halved for per-run)
@@ -138,4 +165,4 @@ Generated code is one function, so look at the hottest 128-byte blocks and `risc
 - ResNet18 is the baseline; ResNet-50 skipped (coverage argument). ViT-B/16 done at full size.
 - fp32 fits 15 GB: Moonshine, Kokoro, Whisper small and large-v3-turbo; Canary-Qwen borderline at 20 GB. The 3B+ LLMs do not fit in fp32; use reduced-layer random-weight configs (2 layers, same widths) and label them as such; extrapolating by layer count is a hypothesis.
 - Mamba (e.g. mamba-130m) planned for coverage: projections are matmuls, the selective scan and depthwise causal conv are not covered yet.
-- Next: profile ViT, then Whisper/Moonshine (conv1d, cross-attention), then reduced-config LLMs (prefill 128/512/2048, decode 512/2048).
+- Done: ResNet18, ViT-B/16, Whisper-tiny encoder. Next: Whisper decoder step (KV cache + cross-attention), weights-as-function-arguments loaded from a file (needed for Whisper-small and up), Moonshine, then reduced-config LLMs (prefill 128/512/2048, decode 512/2048). Consider a fused softmax for long-sequence attention.

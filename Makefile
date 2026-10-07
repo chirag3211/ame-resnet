@@ -18,6 +18,9 @@ CFLAGS  := -O2 -Wall -Wextra -Iinclude
 LIB     := src/ref_matmul.c src/ame_dispatch.c src/memref_shims.c
 ifeq ($(USE_AME),1)
 CFLAGS  += -DUSE_AME
+ifeq ($(AME_COUNT_STEPS),1)
+CFLAGS  += -DAME_COUNT_STEPS
+endif
 LIB     += src/ame_hw.c
 endif
 
@@ -74,17 +77,27 @@ $(B)/resnet18_shims.c: $(B)/resnet18_llvm.mlir mlir/gen_shims.py
 	python3 mlir/gen_shims.py $< $@
 $(B)/resnet18.ll: $(B)/resnet18_llvm.mlir
 	$(MLIR_TR) --mlir-to-llvmir $< -o $@
+# LLVM_OPT=O2|O3 runs LLVM's IR optimizer (opt) before llc; default: none (as measured so far).
+# Like USE_AME, it is not tracked: rm -f $(B)/*.o when changing it.
+LLVM_OPT     ?=
+LLVM_OPT_BIN ?= opt
 $(B)/resnet18.o: $(B)/resnet18.ll
-	$(LLC) $< -mtriple=riscv64-unknown-elf -mattr=+m,+a,+f,+d,+c \
+	@if [ -n "$(LLVM_OPT)" ]; then \
+	  $(LLVM_OPT_BIN) -passes='default<$(LLVM_OPT)>' -mtriple=riscv64-unknown-elf -mattr=+m,+a,+f,+d,+c $< -S -o $(B)/resnet18_opt.ll; \
+	  cp $(B)/resnet18_opt.ll $(B)/resnet18_cg.ll; \
+	 else cp $< $(B)/resnet18_cg.ll; fi
+	$(LLC) $(B)/resnet18_cg.ll -mtriple=riscv64-unknown-elf -mattr=+m,+a,+f,+d,+c \
 	  -target-abi=$(ABI) -filetype=obj -o $@
-# embeds build/input.bin -> symbol _binary_build_input_bin_start (run make from the repo root)
+# embeds $(B)/input.bin -> symbol _binary_input_bin_start (objcopy runs inside $(B) so the symbol is path-independent)
 $(B)/input.o: $(B)/input.bin
-	$(CROSS)objcopy -I binary -O elf64-littleriscv -B riscv $< $@
-$(B)/resnet18.elf: src/main_resnet.c src/memref_copy.c $(B)/resnet18_shims.c $(B)/resnet18.o $(B)/input.o $(LIB)
+	cd $(B) && $(CROSS)objcopy -I binary -O elf64-littleriscv -B riscv input.bin input.o
+DRIVER  ?= src/main_resnet.c
+COMPARE ?= python/compare.py
+$(B)/resnet18.elf: $(DRIVER) src/memref_copy.c $(B)/resnet18_shims.c $(B)/resnet18.o $(B)/input.o $(LIB)
 	$(RVCC) $(CFLAGS) -DINPUT_H=$(SIZE) -DINPUT_W=$(SIZE) -I. $^ -o $@ -lm
 resnet-spike: $(B)/resnet18.elf
 	$(SPIKE) --isa=$(SPIKE_ISA) -m$(SPIKE_MEM) $(PK) $< | tee $(B)/spike_out.txt
-	python3 python/compare.py $(B)/spike_out.txt $(B)/golden_logits.bin
+	python3 $(COMPARE) $(B)/spike_out.txt $(B)/golden_logits.bin
 
 clean:
 	find $(B) -mindepth 1 ! -name "resnet18.mlir" ! -name "input.bin" ! -name "golden_logits.bin" ! -name "meta.json" -delete

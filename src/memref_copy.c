@@ -20,14 +20,26 @@ static void memrefCopy_impl(int64_t elemSize, UnrankedMemRef *src, UnrankedMemRe
   char *dp = d->align + d->offset * elemSize;
   if (rank == 0) { memmove(dp, sp, (size_t)elemSize); return; }
 
+  /* Merge the innermost dims that are contiguous in BOTH src and dst (size-1 dims never matter)
+   * into one run, then memmove one run at a time instead of one element at a time. */
+  int64_t run = 1, k = rank - 1;
+  while (k >= 0) {
+    if (sz[k] == 1) { k--; continue; }
+    if (ss[k] == run && ds[k] == run) { run *= sz[k]; k--; } else break;
+  }
+  const int64_t n = k + 1;               /* outer dims still to iterate: 0..n-1 */
+  const size_t runBytes = (size_t)(run * elemSize);
   int64_t idx[8] = {0};
+  int64_t so = 0, doff = 0;
   for (;;) {
-    int64_t so = 0, doff = 0;
-    for (int64_t i = 0; i < rank; i++) { so += idx[i] * ss[i]; doff += idx[i] * ds[i]; }
-    memmove(dp + doff * elemSize, sp + so * elemSize, (size_t)elemSize);
-    int64_t k = rank - 1;
-    while (k >= 0 && ++idx[k] == sz[k]) idx[k--] = 0;
-    if (k < 0) break;
+    memmove(dp + doff * elemSize, sp + so * elemSize, runBytes);
+    int64_t j = n - 1;
+    for (; j >= 0; j--) {
+      so += ss[j]; doff += ds[j];
+      if (++idx[j] < sz[j]) break;
+      so -= ss[j] * sz[j]; doff -= ds[j] * sz[j]; idx[j] = 0;
+    }
+    if (j < 0) break;
   }
 }
 

@@ -11,6 +11,15 @@
                       int64_t p##_s0, int64_t p##_s1, int64_t p##_st0, int64_t p##_st1
 #define MR2_ARGS(p) p##_alloc, p##_align, p##_off, p##_s0, p##_s1, p##_st0, p##_st1
 
+#define MR3_PARAMS(p) void *p##_alloc, void *p##_align, int64_t p##_off, \
+                      int64_t p##_s0, int64_t p##_s1, int64_t p##_s2, \
+                      int64_t p##_st0, int64_t p##_st1, int64_t p##_st2
+#define MR3_ARGS(p) p##_alloc, p##_align, p##_off, p##_s0, p##_s1, p##_s2, p##_st0, p##_st1, p##_st2
+void ame_bmm_f32_memref(MR3_PARAMS(a), MR3_PARAMS(b), MR3_PARAMS(c));
+#define AME_SHIM3(NAME, IMPL) \
+  void NAME(MR3_PARAMS(a), MR3_PARAMS(b), MR3_PARAMS(c)) { \
+    IMPL(MR3_ARGS(a), MR3_ARGS(b), MR3_ARGS(c)); }
+
 void ame_matmul_f32_memref(MR2_PARAMS(a), MR2_PARAMS(b), MR2_PARAMS(c));
 void ame_matmul_i8_memref(MR2_PARAMS(a), MR2_PARAMS(b), MR2_PARAMS(c));
 

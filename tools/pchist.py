@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# usage: pchist.py ELF HISTFILE   -> top functions, and hottest 128-byte blocks in the top function
+# usage: pchist.py ELF HISTFILE [FUNC] [NBLOCKS]  -> top functions, and hottest 128-byte blocks in FUNC (default: top function, 12 blocks)
 import sys, re, bisect, subprocess, collections
 elf, hist = sys.argv[1], sys.argv[2]
 syms = []
@@ -26,6 +26,8 @@ for a, c in raw:
     byfn[name] += c; byblk[name][a // 128 * 128] += c
 print(f"shift={shift} total={total} unmapped(pk/kernel)={unm} ({100*unm/total:.1f}%)")
 for n, c in byfn.most_common(12): print(f"{c:>12}  {100*c/total:5.1f}%  {n}")
-top = byfn.most_common(1)[0][0]
+top = sys.argv[3] if len(sys.argv) > 3 else byfn.most_common(1)[0][0]
+nb = int(sys.argv[4]) if len(sys.argv) > 4 else 12
+if top not in byblk: sys.exit(f"function {top} not in histogram")
 print("hottest 128-byte blocks in", top)
-for a, c in byblk[top].most_common(12): print(f"  {a:#x}  {c:>12}  {100*c/total:5.1f}%")
+for a, c in byblk[top].most_common(nb): print(f"  {a:#x}  {c:>12}  {100*c/total:5.1f}%")

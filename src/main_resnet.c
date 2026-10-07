@@ -24,13 +24,13 @@ typedef struct { float *alloc, *align; int64_t off, sizes[2]; int64_t strides[2]
 /* with --llvm-request-c-wrappers: result memref returned via pointer (first arg) */
 extern void _mlir_ciface_forward(MemRef2D *out, MemRef4D *in);
 
-extern const unsigned char _binary_build_input_bin_start[];
+extern const unsigned char _binary_input_bin_start[];
 
 static float g_in[1 * 3 * INPUT_H * INPUT_W] __attribute__((aligned(64)));
 static float g_out[1000] __attribute__((aligned(64)));
 
 int main(void) {
-  memcpy(g_in, _binary_build_input_bin_start, sizeof(g_in));
+  memcpy(g_in, _binary_input_bin_start, sizeof(g_in));
   MemRef4D in = {g_in, g_in, 0, {1, 3, INPUT_H, INPUT_W},
                  {3 * INPUT_H * INPUT_W, INPUT_H * INPUT_W, INPUT_W, 1}};
   MemRef2D out = {g_out, g_out, 0, {1, 1000}, {1000, 1}};

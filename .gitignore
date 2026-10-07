@@ -1,1 +1,4 @@
 build/
+build_*/
+__pycache__/
+*.tar.gz

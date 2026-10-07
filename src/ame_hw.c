@@ -7,6 +7,13 @@
 #ifdef __riscv
 #include "ame_insn.h"
 extern unsigned long ame_ksteps, ame_otiles;
+/* Step counters cost ~3 instr per K-step (load/add/store of a global). Off by default so the
+ * measured matmul cost is the algorithm only; build with AME_COUNT_STEPS=1 to get ksteps/otiles. */
+#ifdef AME_COUNT_STEPS
+#define AME_COUNT(x) ((x)++)
+#else
+#define AME_COUNT(x) ((void)0)
+#endif
 
 /* a row of zeros; loaded with stride 0 to clear acc0 (no clear instruction exists) */
 static const float ame_zero_row[256] __attribute__((aligned(64)));
@@ -28,11 +35,11 @@ void ame_hw_matmul_f32(const float *A, const float *B, float *C,
         ame_ld_a32(A + m0 * lda + k0, (uint64_t)(lda * 4));
         ame_ld_b32(B + k0 * ldb + n0, (uint64_t)(ldb * 4));
         ame_mfma_f();
-        ame_ksteps++;
+        AME_COUNT(ame_ksteps);
         k0 += tk;
       }
       ame_st_c32(C + m0 * ldc + n0, (uint64_t)(ldc * 4));
-      ame_otiles++;
+      AME_COUNT(ame_otiles);
       n0 += tn;
     }
     m0 += tm;

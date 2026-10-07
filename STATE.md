@@ -10,12 +10,13 @@ Models so far: ResNet18 (224 and 64), ViT-B/16 (2-layer and full 12-layer). Labe
 
 ## Flow
 ResNet18: `python3 python/export_resnet18.py --size N`
-ViT:      `python3 python/export_vit.py L` (L layers, writes build_vitL/vit.mlir + input.bin + golden_logits.bin; head is randomized, otherwise torchvision zero-inits it and all logits are 0)
-          then `ln -sf vit.mlir build_vitL/resnet18.mlir` (the Makefile still uses the name resnet18.*)
+ViT:      `python3 python/export_vit.py L [OUTDIR] [--orig]` -> build_vitLp/ (default: pre-transposed weights + custom attention, checked against torchvision; max diff 1.7e-6) or build_vitL/ with --orig (plain torchvision; the 858.33M / 4953.64M numbers). Head is randomized (torchvision zero-inits it -> all logits 0).
+          then `ln -sf vit.mlir <OUTDIR>/resnet18.mlir` (the Makefile still uses the name resnet18.*)
 AME:    make [B=<dir>] USE_AME=1 SPIKE=$HOME/riscv-stc/bin/spike SPIKE_ISA=rv64imafdcv_zicntr_matrix resnet-spike SIZE=N
 Scalar: make [B=<dir>] SPIKE_ISA=rv64gc_zicntr resnet-spike SIZE=N
 - B=<dir> keeps models apart (lower_resnet.sh writes its intermediates next to the output file). SIZE must match the exported input (224 for ViT). A SIZE/model mismatch reads past the input buffer and FAILs (seen once).
 - Switching backend: rm -f <B>/resnet18.elf <B>/*.o first (Makefile does not track USE_AME, nor mlir/conv_rewrite.py).
+- Optional switches: `LLVM_OPT=O3` (not tracked by make: rm -f <B>/*.o when changing), `AME_COUNT_STEPS=1` (re-enables ksteps/otiles, costs 3 instr/K-step).
 - rdinstret traps without zicntr in the ISA string. ISA string needs a z-extension between v and matrix.
 - `make clean` keeps resnet18.mlir, input.bin, golden_logits.bin, meta.json.
 - main_resnet.c runs forward twice: RUN0 = cold, RUN1 = warm. Report RUN1. It is reused for every model with signature (1x3x224x224 f32) -> (1x1000 f32).
@@ -57,26 +58,75 @@ The rewrite removed 62.7M (64) / 813.2M (224) instructions in both backends. Cau
 | macs | 3.024G | 17.564G |
 | matmul_calls (STATS) | 58 | 338 |
 | TOP1 / max abs err | 829 / 3.5e-6 PASS | 272 / 4.6e-6 PASS |
+### ViT-B/16 2-layer, pre-transposed weights (default exporter), AME, warm RUN1 (measured)
+forward 699.64M (was 858.33M, -18.5%); in_matmul 410.35M (unchanged); everything else 289.29M (derived, was 447.98M); matmul share 59%. TOP1 829, max abs err 3.6e-6, PASS; 58 calls, 3.024G MACs unchanged.
+Constant transposes in the IR 9 -> 0; total linalg.transpose 26 -> 9. Saving exceeds the weight transposes alone (see Profile findings); the rest is attributed (hypothesis) to the simpler attention graph. Full 12-layer pre-transposed run not done (hypothesis: ~4.0G forward if savings scale per layer).
+
 Matmul efficiency 0.1356 instr/MAC (same as ResNet18). Non-matmul share 52% (derived).
 338 calls = 50 matmuls (48 Linear + patch conv + head) + 24 batch_matmul ops x 12 heads (derived; matches).
 Full-model run: 661 MB vit.mlir (~7.6 bytes/param), `make` wall time 44m06s including export-independent lowering and both Spike runs, max RSS 6.15 GB (of the largest process in the tree; which one is not identified).
 No scalar ViT run yet. Hypothesis from ResNet's scalar cost (7.0-7.5 instr/MAC): scalar full ViT ~125-135B instructions, ~25-27x whole-forward ratio. Not measured.
 No tensor.pad in ViT, so memrefCopy is 0 (consistent with the 18 ResNet copies being the pads).
 
+### ViT-B/16 2-layer pre-transposed: matmul counters off, then LLVM O3 (AME, warm RUN1, measured)
+| | counters on | counters off | + LLVM_OPT=O3 |
+|---|---|---|---|
+| forward | 699.64M | 627.16M | **562.19M** |
+| in_matmul | 410.35M | 337.87M | 337.87M |
+| everything else (derived) | 289.29M | 289.29M | **224.33M** |
+TOP1 829, max abs err 3.636e-6 (identical bits of error across the last two columns), PASS in all three. RUN0-RUN1 gap 109.5M.
+- Counters off: -72.48M = 3.02 instr per K-step x 24.03M K-steps; matmul cost 0.1117 instr/MAC (was 0.1357). ksteps/otiles print 0 unless built with AME_COUNT_STEPS=1.
+- LLVM O3 (opt before llc; the pipeline previously ran no LLVM IR optimization): -64.97M (-22.5% of non-matmul, -10.4% of forward). Matmul unchanged (it is C compiled by gcc).
+- Cumulative on the 2-layer ViT AME forward: 858.33M (original export, counters on, no opt) -> 562.19M (-34.5%). Matmul share is now 60%.
+- Not yet profiled after O3. Hypothesis: erff+expf (~87M/run, if unchanged) are now ~39% of the remaining 224M non-matmul.
+- ResNet18 table above was measured with counters ON and no opt. Re-baseline pending: `tools/bench.sh` (derived prediction at 224 AME: in_matmul ~202.8M from removing 3 x 14.4M counter instr).
+
+### ResNet18 CURRENT BASELINE: counters off + LLVM_OPT=O3 + run-based memrefCopy (warm RUN1, measured via tools/bench.sh; ratios derived)
+| | 64 scalar | 64 AME | 224 scalar | 224 AME |
+|---|---|---|---|---|
+| forward | 1133.41M | 31.99M | 12948.00M | 373.75M |
+| matmul | 1118.14M | 16.73M | 12776.75M | 202.51M |
+| memrefCopy | 4.13M | 4.13M | 39.31M | 39.31M |
+| everything else | 11.14M | 11.14M | 131.94M | 131.94M |
+Whole-forward ratio 35.43x (64), 34.64x (224); matmul-only 66.83x, 63.09x. TOP1 381 / 238, max abs err 2.98e-6 / 3.8e-6, PASS. (Retired instructions, not cycles.)
+AME 224 shares (derived): matmul 54.2%, everything else 35.3%, memrefCopy 10.5%. AME 224 forward vs original 1607.2M: 4.30x lower.
+memrefCopy 224.53M -> 39.31M (-82.5%): ~123 -> ~21 instr per element (derived, ~1.83M floats in the 18 pads).
+Progress of the 224 whole-forward ratio (all warm RUN1): 8.80x (built-in img2col) -> 16.78x (conv_rewrite.py) -> 23.49x (counters off + O3) -> 34.64x (run-based memrefCopy).
+
+### (intermediate step) ResNet18 re-baseline: counters off + LLVM_OPT=O3 (warm RUN1, measured via tools/bench.sh; ratios derived)
+| | 64 scalar | 64 AME | 224 scalar | 224 AME |
+|---|---|---|---|---|
+| forward | 1147.76M | 46.34M | 13133.22M | 558.98M |
+| matmul | 1118.14M | 16.73M | 12776.75M | 202.51M |
+| memrefCopy | 18.48M | 18.48M | 224.53M | 224.53M |
+| everything else | 11.14M | 11.14M | 131.94M | 131.94M |
+Whole-forward ratio 24.77x (64), 23.49x (224); matmul-only 66.83x (64), 63.09x (224). TOP1 381 / 238, max abs err 2.98e-6 / 3.8e-6, PASS. (Retired instructions, not cycles.)
+AME 224 shares (derived): memrefCopy 40.2%, matmul 36.2%, everything else 23.6%. This table supersedes the earlier ResNet table, which had counters on and no opt.
+AME 224 forward vs the original built-in-img2col run: 1607.2M -> 558.98M (2.88x lower).
+memrefCopy is compiled by gcc, so LLVM O3 does not touch it; ~123 instr per element (derived: 224.5M / ~1.83M floats in the 18 pads).
+
 ## Do not use
 Earlier figures 6.6x, 16.2x, 0.489 instr/MAC for ResNet18 AME (cold-start inflated). The warm 16.37x/16.78x above is a different, valid measurement.
 9.19x / 8.80x are valid but pre-rewrite.
 
 ## Open items
-1. Profile the ViT non-matmul 52% (candidates: softmax, LayerNorm, GELU/erff, residual adds, activation transposes/permutes, weight transposes). Command in "Profiling" below.
-2. Weight transposes: in the 2-layer ViT IR, 9 of the 26 linalg.transpose ops take a constant (the Linear weights, 8 + head) and are not folded, so they likely run as scalar copies every forward. ~85.7M floats for 12 layers (derived). Cost not measured. Fix options: pre-transpose in the exporter (nn.MultiheadAttention needs a custom attention module) or constant-fold in MLIR.
-3. ResNet memrefCopy: 28% of AME forward at 224 (224.5M). memrefCopy_impl does one memmove per element; row-wise fast path should cut most of it (hypothesis).
+1. Profile what is left of the ViT non-matmul (289M/run, 2-layer pre-transposed): ~200M of generated loops unidentified (derived, assumes erff/expf unchanged). Candidates: LayerNorm, softmax, residual adds, remaining 9 activation transposes, GELU arithmetic. Re-run the histogram on build_vit2p.
+2. DONE (ViT): weight transposes were confirmed as the hot loops (see Profile findings) and removed by pre-transposing in the exporter. Not applied to other models yet.
+2b. DONE for ViT: matmul step counters are now compile-time optional (AME_COUNT_STEPS=1); K-step is 14 instr. ResNet re-baseline pending.
+2c. DONE for ViT: LLVM_OPT=O3 (opt -> llc). `opt` was not in the buddy-mlir LLVM build and had to be built (`cmake --build ~/buddy-mlir/llvm/build --target opt`). Re-baseline ResNet (scalar and AME alike) with tools/bench.sh.
+3. ResNet memrefCopy: was 40% of AME forward at 224 (224.5M), now 10.5%. DONE: run-based fast path (src/memref_copy.c: merge contiguous inner dims, one memmove per run), checked natively on 20000 random strided cases and on Spike (see CURRENT BASELINE).
 4. Fusing elementwise ops before bufferization: untested on this LLVM.
 5. Matmul tuning (hoist msettilek, multi-accumulator): matmul is 31-48% of forward; K-step = 17 instr (incl. 3 counter instr), ~126 of 128 MACs.
 6. Decode steps are matrix-vector (M=1): an 8-row tile would use ~1/8 of the unit (hypothesis); may need a different mapping.
 7. int8 (mqma.b.mm) needs a quantized model; needed to fit the large LLMs in RAM.
 8. conv_rewrite.py gaps: groups/depthwise, conv1d, transposed conv, dilation, N>1 (needed for Whisper/Moonshine/Canary/Kokoro/Mamba).
 9. Target is the riscv-stc v0.5 matrix extension, not the task-group Zvame draft.
+
+## Profile findings (ViT 2-layer, original export, hist covers RUN0+RUN1+pk, halved for per-run)
+Per run: ame_hw K-loop ~410M (2 blocks, = 24.03M ksteps x 17); `forward` loops ~357.6M; erff ~50.6M (~42 instr/call if 1 call/GELU element); expf ~36.8M (~40/call); memcpy ~2.9M. Sum of non-matmul = 447.9M, matches the counter-derived 447.98M.
+Unmapped (pk/kernel) 142.4M ~ RUN0-RUN1 gap 133.9M + startup.
+Hot blocks in forward were weight-transpose loops (7-8 instr/element, strided reads): predicted vs histogram/2: QKV 14.16M/14.16M, fc1 18.87M/18.88M, fc2 16.52M/16.54M (within 0.1%). Six blocks = 99.5M per run (22% of non-matmul, 11.6% of forward).
+tools/pchist.py usage: `pchist.py ELF HIST [FUNC] [NBLOCKS]`.
 
 ## Profiling (Spike PC histogram; command from memory, check `spike --help 2>&1 | grep -i hist`)
 spike -g prints "PC Histogram" lines (pc count) to stderr at exit (both RUN0 and RUN1 and pk code are included):

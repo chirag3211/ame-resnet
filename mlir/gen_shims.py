@@ -10,7 +10,7 @@ EXPECTED_ARGS = 21
 
 def main(mlir_path, out_path):
     text = open(mlir_path).read()
-    found = re.findall(r"llvm\.func\s+(?:\w+\s+)*@(ame_mm_[A-Za-z0-9_]+)\(([^)]*)\)", text)
+    found = re.findall(r"llvm\.func\s+(?:\w+\s+)*@(ame_b?mm_[A-Za-z0-9_]+)\(([^)]*)\)", text)
     if not found:
         sys.exit(f"gen_shims: no ame_mm_* declarations found in {mlir_path}")
     lines = [
@@ -24,12 +24,16 @@ def main(mlir_path, out_path):
             continue
         seen.add(name)
         nargs = len([p for p in params.split(",") if p.strip()])
-        if nargs != EXPECTED_ARGS:
+        want = 27 if name.startswith("ame_bmm_") else EXPECTED_ARGS
+        if nargs != want:
             sys.exit(
-                f"gen_shims: @{name} has {nargs} args, expected {EXPECTED_ARGS}. "
+                f"gen_shims: @{name} has {nargs} args, expected {want}. "
                 "The memref calling convention differs from the assumption; "
                 "paste the declaration to Claude."
             )
+        if name.startswith("ame_bmm_f32_"):
+            lines.append(f"AME_SHIM3({name}, ame_bmm_f32_memref)")
+            continue
         if name.startswith("ame_mm_f32_"):
             impl = "ame_matmul_f32_memref"
         elif name.startswith("ame_mm_i8_"):

@@ -61,7 +61,8 @@ def main(src_path, dst_path):
     pieces = []
     pos = 0
     # the op may span several lines when hand-written, so parse the whole text
-    for m in re.finditer(r"\blinalg\.matmul\b(?=\s*(?:\{[^}]*\}\s*)?ins\()", text):
+    for m in re.finditer(r"\blinalg\.(batch_matmul|matmul)\b(?=\s*(?:\{[^}]*\}\s*)?ins\()", text):
+        prefix = "ame_bmm" if m.group(1) == "batch_matmul" else "ame_mm"
         if m.start() < pos:
             continue
         ins_open = text.index("ins(", m.end()) + 3
@@ -77,9 +78,9 @@ def main(src_path, dst_path):
         (tc,) = split_top(outs_types)
 
         kind = elem_kind(ta, tb, tc)
-        key = (kind, ta, tb, tc)
+        key = (prefix, kind, ta, tb, tc)
         if key not in decls:
-            decls[key] = f"ame_mm_{kind}_{counter}"
+            decls[key] = f"{prefix}_{kind}_{counter}"
             counter += 1
         name = decls[key]
         pieces.append(text[pos: m.start()])
@@ -88,13 +89,10 @@ def main(src_path, dst_path):
     pieces.append(text[pos:])
     out = "".join(pieces)
 
-    nbatch = len(re.findall(r"\blinalg\.batch_matmul\b", out))
-    if nbatch:
-        print(f"warning: {nbatch} linalg.batch_matmul op(s) left untouched", file=sys.stderr)
 
     decl_text = "".join(
         f"  func.func private @{n}({ta}, {tb}, {tc})\n"
-        for (kind, ta, tb, tc), n in decls.items()
+        for (_pf, kind, ta, tb, tc), n in decls.items()
     )
     if decl_text:
         if re.search(r"^\s*module\b", out, re.M):

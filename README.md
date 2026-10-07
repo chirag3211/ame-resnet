@@ -9,7 +9,7 @@ Current measurements, environment and open items live in `STATE.md`.
 ## Pipeline
 ```
 python/export_resnet18.py        torch -> torch-mlir (linalg-on-tensors) -> build/resnet18.mlir
-python/export_vit.py L           ViT with L layers -> build_vitL/vit.mlir (link it as resnet18.mlir; see below)
+python/export_vit.py L           ViT with L layers -> build_vitLp/vit.mlir (pre-transposed weights; --orig = plain torchvision -> build_vitL/)
                                  + build/input.bin, build/golden_logits.bin (PyTorch reference)
 mlir/lower_resnet.sh
   [1] mlir/conv_rewrite.py       conv_2d_nchw_fchw -> 5D gather generic (no div/mod) + collapse
@@ -45,9 +45,9 @@ it also does not list `mlir/conv_rewrite.py` as a dependency of `resnet18_llvm.m
 
 ## Running another model (e.g. ViT)
 ```
-python3 python/export_vit.py 12                     # or 2 for a quick 2-layer check
-ln -sf vit.mlir build_vit12/resnet18.mlir           # the Makefile still names things resnet18.*
-make B=build_vit12 USE_AME=1 SPIKE=$HOME/riscv-stc/bin/spike SPIKE_ISA=rv64imafdcv_zicntr_matrix resnet-spike SIZE=224
+python3 python/export_vit.py 12                     # -> build_vit12p; or 2 for a quick 2-layer check
+ln -sf vit.mlir build_vit12p/resnet18.mlir          # the Makefile still names things resnet18.*
+make B=build_vit12p USE_AME=1 SPIKE=$HOME/riscv-stc/bin/spike SPIKE_ISA=rv64imafdcv_zicntr_matrix resnet-spike SIZE=224
 ```
 `B=<dir>` keeps each model's intermediates separate. `main_resnet.c` is reused for any model with a
 (1x3x224x224 f32) -> (1x1000 f32) `forward`. SIZE must match the exported input.
@@ -70,4 +70,4 @@ at 64x64) and RUN1 is warm; **report RUN1 only**. It prints forward / in_matmul 
 `make test-native`, `make test-spike`, `make mlir-matmul-spike` (single matmul through MLIR), then ResNet18.
 
 ## Known limits
-`conv_rewrite.py`: N=1, f32, no dilation, no groups, conv_2d_nchw_fchw only. int8 still scalar. Linear weight transposes are not folded (see STATE.md open items).
+`conv_rewrite.py`: N=1, f32, no dilation, no groups, conv_2d_nchw_fchw only. int8 still scalar. Weight transposes are not folded by MLIR (weights are opaque resources), so ViT exports pre-transpose them in Python.

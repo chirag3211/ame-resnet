@@ -1,5 +1,5 @@
-# STATE (Oct 7 2026)  -- PyTorch -> torch-mlir -> RV64 -> riscv-stc Spike (AME matrix extension)
-Models so far: ResNet18 (224 and 64), ViT-B/16 (2-layer and full 12-layer). Label convention below:
+# STATE (Oct 8 2026)  -- PyTorch -> torch-mlir -> RV64 -> riscv-stc Spike (AME matrix extension)
+Models so far: ResNet18 (224 and 64), ViT-B/16 (2-layer and full 12-layer), Whisper-tiny encoder + decoder step, Moonshine-tiny encoder. Scalar baselines done for ResNet18, Whisper-tiny decoder step, Moonshine-tiny, ViT 2-layer (see the scalar sections). Next steps and open work: TODO.md. Label convention below:
 **measured** = printed by the program, **derived** = arithmetic on measured numbers, **hypothesis** = not verified.
 
 ## Environment (WSL Ubuntu, user chirag; WSL RAM budget 15 GB, can go to 20 GB)
@@ -145,11 +145,67 @@ Open: the 69% non-matmul share and the 88M in_copy (50 copies, vs 33M for the mu
 `--weights-as-args` on export_whisper.py / export_whisper_dec.py: parameters+buffers become trailing function args (torch.func.functional_call), written to <dir>/weights.bin (64B-aligned), IR has no weight constants. gen_driver.py loads weights.bin at run time with fopen/fread (pk reads host files: verified with a probe on both Spikes); run Spike from the repo root; raise SPIKE_MEM for big weights (make ... SPIKE_MEM=4096). Verified on the decoder step: model.mlir 385 MB -> 117 KB, weights.bin 189 MB (102 weight args), PASS with identical errors; AME RUN1 forward 34,143,861 (inline: 34,085,757, +0.17%, all in non-matmul, cause not isolated; in_matmul and in_copy identical). RUN0-RUN1 gap fell from 142M to 0.80M (first-touch moves into fread before timing), so RUNS=1 is accurate to ~2% for big models.
 Size estimates (derived from 8 bytes/param of inline MLIR): Whisper-small decoder ~1.4 GB, large-v3-turbo decoder ~1.9 GB, large-v3-turbo encoder ~3.2 GB of MLIR text -> need this path.
 
+### Moonshine-tiny ENCODER, 10 s: SCALAR build and AME-vs-scalar (warm RUN1, measured; ratios derived)
+Command: same as the AME build but `rm -f $D/resnet18.elf $D/*.o` first and `LLVM_OPT=O3 SPIKE_ISA=rv64gc_zicntr` (no USE_AME, stock spike). Same dir build_moonshine_tiny_enc10sp, same model.mlir, same driver.
+| | RUN0 (cold) | RUN1 (warm) |
+|---|---|---|
+| forward | 32,069,448,808 | **31,851,064,097** |
+| in_matmul | 30,514,537,279 | 30,476,136,456 (95.7%) |
+| in_copy (50 calls) | 93,306,715 | 88,404,666 (0.28%) |
+| everything else (derived) | | 1,286,522,975 (4.0%) |
+STATS backend=reference-scalar matmul_calls=136 macs=4,336,487,440 -> scalar matmul 7.028 instr/MAC. PASS, errors identical to AME (max abs err sampled 6.437e-6, sumsq rel err 2.40e-9, projection err 1.32e-6).
+AME vs scalar (derived): whole-forward 17.16x (31851.06M / 1856.30M); matmul-only 63.31x (30476.14M / 481.37M). Everything else identical in both builds (1,286,522,975, exact). RUN0-RUN1 gap 218.38M scalar vs 218.39M AME (first-touch cost the same in both).
+
+### ViT-B/16 2-layer, pre-transposed, O3, counters off: SCALAR build and AME-vs-scalar (warm RUN1, measured; ratios derived)
+Dir build_vit2p, `make B=build_vit2p LLVM_OPT=O3 SPIKE_ISA=rv64gc_zicntr resnet-spike SIZE=224` after `rm -f build_vit2p/resnet18.elf build_vit2p/*.o`.
+| | AME (O3, counters off) | scalar (O3) |
+|---|---|---|
+| RUN0 forward | | 21,531,591,653 |
+| RUN1 forward | 562.19M | **21,422,072,116** |
+| in_matmul | 337.87M | 21,197,745,690 |
+| in_copy | 0 | 0 |
+| everything else (derived) | 224.32M | 224.33M (224,326,426) |
+STATS backend=reference-scalar matmul_calls=58 macs=3,024,282,624 -> scalar matmul 7.009 instr/MAC. TOP1 829 (matches PyTorch), max abs err 3.636e-6 (identical to AME). RUN0-RUN1 gap 109.52M (same as the AME gap, 109.5M).
+AME vs scalar (derived): whole-forward 38.10x; matmul-only 62.74x. The AME column uses the 2-decimal-M figures recorded above, so ratios are good to ~4 digits.
+Not run yet: full 12-layer scalar and a 12-layer AME re-run on the current pipeline (see TODO.md; the 4953.64M number is the old build: original export, counters on, no O3, so it is NOT comparable with any scalar number measured now).
+
+### Summary of AME vs scalar ratios so far (warm RUN1, derived)
+| Workload | whole-forward | matmul-only | scalar matmul instr/MAC | non-matmul share of AME forward |
+|---|---|---|---|---|
+| ResNet18 224 | 34.64x | 63.09x | ~7.0 | 45.8% (copy 10.5% + other 35.3%) |
+| ResNet18 64 | 35.43x | 66.83x | ~7.0 | 47.7% |
+| ViT-B/16 2-layer pre-transposed | 38.10x | 62.74x | 7.009 | 39.9% |
+| Moonshine-tiny enc 10 s | 17.16x | 63.31x | 7.028 | 74.1% (copy 4.8% + other 69.3%) |
+| Whisper-tiny dec step | 6.9x | 7.9x | 7.01 | 14.7% (matmul 0.885 instr/MAC, M=1) |
+| Whisper-tiny enc 30 s | not run (scalar) | | | 73.9% |
+Reading (derived/hypothesis): the matmul ratio is ~63x for every large-M workload because it is set by the kernel (one mfma = 128 MACs per ~14-instr K-step vs ~7 instr/MAC scalar), not by the model. The whole-forward ratio is set by the non-matmul share, which stays on the scalar core in both builds (identical "everything else" in every pair that was checked). Decode steps (M=1) use 1 of 8 tile rows, so even the matmul ratio is only 7.9x.
+
+## fp16 on AME: findings (Oct 8 2026; investigated, NOT ported; the whole pipeline is still fp32)
+Question asked: can the pipeline be run in fp16 (the teammate's workload study used fp16 shapes)? Answer so far: the instruction exists, but the accumulator is fp16, so a straight port is not numerically usable for long K.
+- **Spec** (~/work/riscv-matrix-spec): e16 loads/stores/moves exist (mlae16.m, mlbe16.m, mlce16.m, msce16.m ...); ext-type.adoc:548 says e16 load/store/move are used for FP16 data, :600 for BF16, :181 for int16. The spec's e16 matmul examples store the C tile with 16-bit element stores (stride n*2).
+- **Spike** (~/work/riscv-stc-sim, built into ~/riscv-stc/bin/spike): has mfma_hf_mm (fp16), next to mfma_f_mm (fp32), mfma_d_mm (fp64), generic mfma_mm, and sparse mfma_spa_* / mfma_spb_* forms (not used here). `mfmax_*_mm` is an ELEMENTWISE MAX of two tiles (f16_max/f32_max/...), i.e. for max-pooling; it is NOT a widening multiply-add. int8 is mqma_b_mm / mqmau_b_mm. e32 also has a tf32 mode (f32_to_tf32) selected by the mfp32 field.
+- **Encodings** (include/riscv/encoding.h): MATCH_MFMA_HF_MM 0x22001877 (funct3=1, funct7=0x11), MATCH_MFMA_F_MM 0x22002877 (funct3=2). msetfp16 = 0x203e077 (field id in the rs1 slot = x7, value in the rs2 slot), msetfp32 = 0x2046077 (field id x8). mtype bits: mfp16 = bits 10-11, mfp32 = bits 12-13 (set_fp(rd, simm5, 10) for fp16, 12 for fp32). MTYPE_FP16 = 0x1, MTYPE_BF16 = 0x2 (m_ext_macros.h:12-13). After `msetsew e16` + `msetfp16 1`, mtype reads 0x401 (measured).
+- **Accumulator is fp16 (read from source and measured).** MXU_VFP_VV_LOOP (m_ext_macros.h:1207) case e16 reads/writes the accumulator as float16_t (bfloat16_t for BF16) and does `td = f16_mulAdd(ts1, ts2, td)`, so every partial sum is rounded to fp16. The e32 case uses float32_t. Probe tests/ame_fp16_probe.c (all-ones inputs, accumulate in acc0 across K in one tile): K=8 -> 8, K=1024 -> 1024, K=2048 -> 2048, K=2560 -> 2048, K=4096 -> 2048 (measured). The sum stalls at 2048 (fp16 spacing 2 there). All-ones is the worst case; real signed data stalls less, but error size on real shapes is NOT measured yet.
+- **Tile (e16) granted m=8 k=8 n=8** (measured), vs 8/4/4 for fp32: one fp16 mfma = 512 MACs vs 128 for fp32 (derived). Hypothesis (not measured): matmul cost could drop to ~0.03 instr/MAC if the K-step stays ~14 instr.
+- **ISA string needs zfh.** M_FLOAT_TYPE_CHECK requires EXT_ZFH for e16 (EXT_MATRIX_ZMF8E* for e8 float, 'F' for e32, 'D' for e64). Without it the first mfma_hf traps ("An illegal instruction was executed", va/inst 0x22101877, seen with rv64imafdcv_zicntr_matrix). Working string: `rv64imafdcv_zfh_zicntr_matrix` (measured; the probe ran). Order: z-extensions between v and matrix.
+- Probe build/run: `riscv64-unknown-elf-gcc -O2 -march=rv64gc -mabi=lp64d -Iinclude tests/ame_fp16_probe.c -o build/ame_fp16_probe.elf` then `$HOME/riscv-stc/bin/spike --isa=rv64imafdcv_zfh_zicntr_matrix $HOME/riscv/riscv64-unknown-elf/bin/pk build/ame_fp16_probe.elf`. FP16VAL defaults to 1 (correct).
+- **Consequences if fp16 is pursued (all hypotheses/derived, none measured):** (1) K=768 (ViT) and K=1152 (Moonshine FFN) accumulated in fp16 will have errors far above the current ~1e-6; the PASS criterion would need a tolerance or K-chunking (accumulate e.g. 64-256 K in fp16, then convert and add into fp32 in software), and the flush cost changes every instr/MAC number. (2) A scalar fp16 baseline needs zfh in the compiler (-march=...zfh) and in Spike, otherwise _Float16 is emulated through fp32 and the baseline is unfairly slow. (3) The MLIR side assumes f32: conv_rewrite.py (f32 only), matmul_to_call.py (@ame_mm_f32_<n>), gen_shims.py, memref_shims.c, drivers and compare scripts; erff/expf have no fp16 libm (upcast adds instructions). (4) fp16 is a separate experiment, not a re-run; keep the fp32 results as the main data.
+- Decision (Oct 8): keep fp32 as the main pipeline; next fp16 step is a small error-vs-chunk-size test on real shapes (TODO.md), before touching the MLIR pipeline.
+
+## Relation to the teammate's workload study (Workload_Characterization.html; Oct 8)
+- His page is STATIC: it records every PyTorch op with exact shapes on the meta device (no weights), fp16, batch 1, TorchDispatchMode, and reports MACs, bytes (inputs + outputs per op, no cache reuse, upper bound), intensity. Exception: Kokoro runs with real weights in fp32. Nothing else on the page is stated to differ.
+- This repo is MEASURED: retired instructions on Spike, fp32, seeded random weights, reduced-layer or custom export graphs in places (pre-transposed ViT, hand-written Whisper decoder step). So his bytes and intensity are NOT comparable with anything computed from fp32 tensors here (2x bytes); his MACs ARE comparable (precision independent).
+- MAC cross-check: ViT-B/16 17.5638 GMAC (his) vs 17.564G (STATS, this repo): match. Moonshine tiny encoder 4.4026 GMAC (his, 10 s) vs 4.336G (STATS): ours is 1.5% lower; cause not investigated (hypothesis: small non-matmul-counted ops, e.g. the rotary, pooling or other ops his op-recorder counts). Whisper-tiny and ResNet18 are not on his page; ResNet-50 is (4.0892 GMAC) and is skipped here.
+- Agreement: his decode steps have intensity <= 0.8 FLOP/B (memory-bound); here the Whisper-tiny decode step gets only 6.9x whole-forward and 0.885 instr/MAC for matmul (M=1). His non-MAC byte shares (softmax, norm, elementwise, data movement) correspond to the scalar-core work that is 40-74% of AME forward instructions here.
+- Results page for this repo, in his style (same layout, tokens, filters): AME_Measured_Results.html (generated outside the repo; built from the numbers in this file; needs the new scalar rows added, see TODO.md).
+
 ## Do not use
 Earlier figures 6.6x, 16.2x, 0.489 instr/MAC for ResNet18 AME (cold-start inflated). The warm 16.37x/16.78x above is a different, valid measurement.
 9.19x / 8.80x are valid but pre-rewrite.
 
 ## Open items
+(Full prioritized plan and what is done: TODO.md. Items below are the original list.)
+0. Review issues found Oct 8 (details in TODO.md): matmul ratio ~63x is mostly tile size and the scalar baseline is a naive C triple loop (no blocking, no RVV, even though the Spike ISA has v); non-matmul share (40-74% of AME forward) is unexplained for Moonshine/Whisper (only ViT profiled); AME vs scalar rows are on different pipeline versions in places (ViT 12-layer old build); compare_tensor.py is sampled, not exact; Makefile does not track USE_AME / LLVM_OPT / conv_rewrite.py; results are copied by hand.
 1. Profile what is left of the ViT non-matmul (289M/run, 2-layer pre-transposed): ~200M of generated loops unidentified (derived, assumes erff/expf unchanged). Candidates: LayerNorm, softmax, residual adds, remaining 9 activation transposes, GELU arithmetic. Re-run the histogram on build_vit2p.
 2. DONE (ViT): weight transposes were confirmed as the hot loops (see Profile findings) and removed by pre-transposing in the exporter. Not applied to other models yet.
 2b. DONE for ViT: matmul step counters are now compile-time optional (AME_COUNT_STEPS=1); K-step is 14 instr. ResNet re-baseline pending.
@@ -178,4 +234,4 @@ Generated code is one function, so look at the hottest 128-byte blocks and `risc
 - ResNet18 is the baseline; ResNet-50 skipped (coverage argument). ViT-B/16 done at full size.
 - fp32 fits 15 GB: Moonshine, Kokoro, Whisper small and large-v3-turbo; Canary-Qwen borderline at 20 GB. The 3B+ LLMs do not fit in fp32; use reduced-layer random-weight configs (2 layers, same widths) and label them as such; extrapolating by layer count is a hypothesis.
 - Mamba (e.g. mamba-130m) planned for coverage: projections are matmuls, the selective scan and depthwise causal conv are not covered yet.
-- Done: ResNet18, ViT-B/16, Whisper-tiny encoder, Moonshine-tiny encoder (10 s). Next: Whisper decoder step (KV cache + cross-attention), weights-as-function-arguments loaded from a file (needed for Whisper-small and up), Moonshine-base, then reduced-config LLMs (prefill 128/512/2048, decode 512/2048). Consider a fused softmax for long-sequence attention.
+- Done (AME): ResNet18, ViT-B/16, Whisper-tiny encoder + decoder step, Moonshine-tiny encoder (10 s). Done (scalar too): ResNet18, Whisper-tiny decoder step, Moonshine-tiny, ViT 2-layer. Whisper-small was running as of the last commit (not recorded here yet). Next: Whisper decoder step (KV cache + cross-attention), weights-as-function-arguments loaded from a file (needed for Whisper-small and up), Moonshine-base, then reduced-config LLMs (prefill 128/512/2048, decode 512/2048). Consider a fused softmax for long-sequence attention.

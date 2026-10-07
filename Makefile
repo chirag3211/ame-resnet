@@ -96,7 +96,8 @@ COMPARE ?= python/compare.py
 $(B)/resnet18.elf: $(DRIVER) src/memref_copy.c $(B)/resnet18_shims.c $(B)/resnet18.o $(B)/input.o $(LIB)
 	$(RVCC) $(CFLAGS) -DINPUT_H=$(SIZE) -DINPUT_W=$(SIZE) -I. $^ -o $@ -lm
 resnet-spike: $(B)/resnet18.elf
-	$(SPIKE) --isa=$(SPIKE_ISA) -m$(SPIKE_MEM) $(PK) $< | tee $(B)/spike_out.txt
+	bash -o pipefail -c '$(SPIKE) --isa=$(SPIKE_ISA) -m$(SPIKE_MEM) $(PK) $< | tee $(B)/spike_out.txt' \
+	  || { rc=$$?; echo "SPIKE EXITED rc=$$rc (137=killed/OOM, 1/2=pk trap or program exit)"; exit $$rc; }
 	python3 $(COMPARE) $(B)/spike_out.txt $(B)/golden_logits.bin
 
 clean:

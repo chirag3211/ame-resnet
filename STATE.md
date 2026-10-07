@@ -128,6 +128,19 @@ RUN0 176.0M vs RUN1 34.1M: 142M first-touch of the 385 MB of constants (mostly i
 Model: python/export_whisper_dec.py (custom step module; K caches stored transposed [H,hd,T]; checked vs HF decoder before export). HF's own decoder export produced tensor.scan/tensor.concat (not handled), so the custom module is used.
 Idea (not done): matrix-vector role swap (weights on the 8-row side) would raise best case from 16 to 32 MACs/K-step (~2x), needs a suitable transposed tile load (spec not checked).
 
+### Moonshine-tiny ENCODER, 10 s (1x160000 raw audio samples -> 1x415x288), AME, LLVM_OPT=O3, counters off, random weights inlined, pre-transposed Linears (measured; ratios derived)
+Export: `python3 python/export_moonshine.py tiny [--samples N] [--orig] [--weights-as-args]` -> build_moonshine_tiny_enc10sp/ (the script must live in python/ next to ame_export.py). Pre-transposed vs original max abs diff 0.0. conv_rewrite: 3 convs rewritten, 0 left; 9 distinct matmul signatures; model.mlir 61 MB (0 weight args).
+| | RUN0 (cold) | RUN1 (warm) |
+|---|---|---|
+| forward | 2,074,692,566 | **1,856,301,995** |
+| in_matmul | 519,775,177 | 481,374,354 (25.9%) |
+| in_copy (50 calls) | 93,306,715 | 88,404,666 (4.8%) |
+| everything else (derived) | 1,461,610,674 | 1,286,522,975 (69.3%) |
+RUN0-RUN1 gap 218.39M (11.8% of RUN1; weights are inlined, so first-touch is inside the forward). Report RUN1.
+STATS: matmul_calls=136, macs=4,336,487,440 -> matmul 0.1110 instr/MAC (same as Whisper/ResNet). Correctness: max abs err (sampled) 6.437e-6, |gold|max 5.15, sumsq rel err 2.40e-9, projection err 1.32e-6, PASS.
+Call/MAC reconciliation (derived from r18_3_calls.mlir signatures + hand count; matches STATS exactly): 3 conv matmuls (288x127@127x2499, 576x2016@2016x831, 288x1728@1728x415; 1,262,904,480 MACs) + 6 layers x (4 projections 415x288@288x288, fc1 415x288@288x1152, fc2 415x1152@1152x288, QK^T and AV as 8x415x36 / 8x415x415 batch_matmul = 16 per-head calls) = 132 calls, 3,073,576,320 MACs + 1 rotary matmul (bmm 1x16x1 @ 1x1x415, 6,640 MACs) = 136 calls. Config verified from transformers MoonshineConfig() defaults (printed in the venv): hidden 288, 6 layers, 8 heads, FFN 1152, head_dim 36, partial_rotary_factor 0.9 -> rotary dim int(36*0.9)=32 -> 16 frequencies (matches the 1x16x1 rotary bmm in the IR); 415 positions.
+Open: the 69% non-matmul share and the 88M in_copy (50 copies, vs 33M for the much larger Whisper-small encoder) are not profiled; cause of the copy cost not isolated (hypothesis: conv rewrite/padding).
+
 ### Weights as function arguments (implemented; verified on the Whisper-tiny decoder step)
 `--weights-as-args` on export_whisper.py / export_whisper_dec.py: parameters+buffers become trailing function args (torch.func.functional_call), written to <dir>/weights.bin (64B-aligned), IR has no weight constants. gen_driver.py loads weights.bin at run time with fopen/fread (pk reads host files: verified with a probe on both Spikes); run Spike from the repo root; raise SPIKE_MEM for big weights (make ... SPIKE_MEM=4096). Verified on the decoder step: model.mlir 385 MB -> 117 KB, weights.bin 189 MB (102 weight args), PASS with identical errors; AME RUN1 forward 34,143,861 (inline: 34,085,757, +0.17%, all in non-matmul, cause not isolated; in_matmul and in_copy identical). RUN0-RUN1 gap fell from 142M to 0.80M (first-touch moves into fread before timing), so RUNS=1 is accurate to ~2% for big models.
 Size estimates (derived from 8 bytes/param of inline MLIR): Whisper-small decoder ~1.4 GB, large-v3-turbo decoder ~1.9 GB, large-v3-turbo encoder ~3.2 GB of MLIR text -> need this path.
@@ -165,4 +178,4 @@ Generated code is one function, so look at the hottest 128-byte blocks and `risc
 - ResNet18 is the baseline; ResNet-50 skipped (coverage argument). ViT-B/16 done at full size.
 - fp32 fits 15 GB: Moonshine, Kokoro, Whisper small and large-v3-turbo; Canary-Qwen borderline at 20 GB. The 3B+ LLMs do not fit in fp32; use reduced-layer random-weight configs (2 layers, same widths) and label them as such; extrapolating by layer count is a hypothesis.
 - Mamba (e.g. mamba-130m) planned for coverage: projections are matmuls, the selective scan and depthwise causal conv are not covered yet.
-- Done: ResNet18, ViT-B/16, Whisper-tiny encoder. Next: Whisper decoder step (KV cache + cross-attention), weights-as-function-arguments loaded from a file (needed for Whisper-small and up), Moonshine, then reduced-config LLMs (prefill 128/512/2048, decode 512/2048). Consider a fused softmax for long-sequence attention.
+- Done: ResNet18, ViT-B/16, Whisper-tiny encoder, Moonshine-tiny encoder (10 s). Next: Whisper decoder step (KV cache + cross-attention), weights-as-function-arguments loaded from a file (needed for Whisper-small and up), Moonshine-base, then reduced-config LLMs (prefill 128/512/2048, decode 512/2048). Consider a fused softmax for long-sequence attention.

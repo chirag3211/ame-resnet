@@ -26,6 +26,26 @@ endif
 
 RVCC    := $(CROSS)gcc -march=$(ARCH) -mabi=$(ABI)
 
+# ---------------------------------------------------------------------------
+#  Flag stamps: a stamp file holds the flags that change an output; it is rewritten only when they change, so
+#  anything depending on it is rebuilt exactly then (no more `rm -f $(B)/*.o` when switching backend/opt level).
+#    .flags_cg    : LLVM optimisation / codegen (opt + llc)      -> resnet18.o   (the slow step for big models)
+#    .flags_link  : C compile of driver + kernels (USE_AME ...)  -> resnet18.elf (cheap, seconds)
+#  So changing USE_AME or AME_COUNT_STEPS recompiles only the C and relinks; llc is not redone.
+#  Not stamped: CONV_REWRITE=0 and MLIR_OPT (rm $(B)/resnet18_llvm.mlir after changing them). The lowering step
+#  does depend on mlir/*.py, so editing conv_rewrite.py re-lowers (slow for the big models, correct).
+# ---------------------------------------------------------------------------
+.DEFAULT_GOAL := all   # the stamp rules below come first; without this a bare `make` would build only build/.flags_cg
+CG_FLAGS    = LLVM_OPT=$(LLVM_OPT) LLVM_OPT_BIN=$(LLVM_OPT_BIN) LLC=$(LLC) ARCH=$(ARCH) ABI=$(ABI)
+LINK_FLAGS  = USE_AME=$(USE_AME) AME_COUNT_STEPS=$(AME_COUNT_STEPS) CFLAGS=$(CFLAGS) CROSS=$(CROSS) ARCH=$(ARCH) ABI=$(ABI) SIZE=$(SIZE) DRIVER=$(DRIVER)
+HDRS        := $(wildcard include/*.h) $(wildcard src/*.inc)
+
+$(B)/.flags_cg: FORCE
+	@mkdir -p $(B); printf '%s\n' '$(CG_FLAGS)' | cmp -s - $@ || printf '%s\n' '$(CG_FLAGS)' > $@
+$(B)/.flags_link: FORCE
+	@mkdir -p $(B); printf '%s\n' '$(LINK_FLAGS)' | cmp -s - $@ || printf '%s\n' '$(LINK_FLAGS)' > $@
+FORCE:
+
 .PHONY: all test-native test-spike mlir-matmul-spike resnet-spike clean
 
 all: test-native
@@ -71,17 +91,17 @@ mlir-matmul-spike: $(B)/matmul_mlir.elf
 
 # ----- Phase C: ResNet18 (needs build/resnet18.mlir from python/export_resnet18.py) -----
 SIZE ?= 224
-$(B)/resnet18_llvm.mlir: $(B)/resnet18.mlir mlir/lower_resnet.sh mlir/matmul_to_call.py
+$(B)/resnet18_llvm.mlir: $(B)/resnet18.mlir mlir/lower_resnet.sh mlir/matmul_to_call.py mlir/conv_rewrite.py mlir/add_ciface.py mlir/conv_to_matmul.mlir
 	bash mlir/lower_resnet.sh $< $@
 $(B)/resnet18_shims.c: $(B)/resnet18_llvm.mlir mlir/gen_shims.py
 	python3 mlir/gen_shims.py $< $@
 $(B)/resnet18.ll: $(B)/resnet18_llvm.mlir
 	$(MLIR_TR) --mlir-to-llvmir $< -o $@
 # LLVM_OPT=O2|O3 runs LLVM's IR optimizer (opt) before llc; default: none (as measured so far).
-# Like USE_AME, it is not tracked: rm -f $(B)/*.o when changing it.
+# Tracked through $(B)/.flags_cg (changing it re-runs opt + llc).
 LLVM_OPT     ?=
 LLVM_OPT_BIN ?= opt
-$(B)/resnet18.o: $(B)/resnet18.ll
+$(B)/resnet18.o: $(B)/resnet18.ll $(B)/.flags_cg
 	@if [ -n "$(LLVM_OPT)" ]; then \
 	  $(LLVM_OPT_BIN) -passes='default<$(LLVM_OPT)>' -mtriple=riscv64-unknown-elf -mattr=+m,+a,+f,+d,+c $< -S -o $(B)/resnet18_opt.ll; \
 	  cp $(B)/resnet18_opt.ll $(B)/resnet18_cg.ll; \
@@ -93,8 +113,8 @@ $(B)/input.o: $(B)/input.bin
 	cd $(B) && $(CROSS)objcopy -I binary -O elf64-littleriscv -B riscv input.bin input.o
 DRIVER  ?= src/main_resnet.c
 COMPARE ?= python/compare.py
-$(B)/resnet18.elf: $(DRIVER) src/memref_copy.c $(B)/resnet18_shims.c $(B)/resnet18.o $(B)/input.o $(LIB)
-	$(RVCC) $(CFLAGS) -DINPUT_H=$(SIZE) -DINPUT_W=$(SIZE) -I. $^ -o $@ -lm
+$(B)/resnet18.elf: $(DRIVER) src/memref_copy.c $(B)/resnet18_shims.c $(B)/resnet18.o $(B)/input.o $(LIB) $(HDRS) $(B)/.flags_link
+	$(RVCC) $(CFLAGS) -DINPUT_H=$(SIZE) -DINPUT_W=$(SIZE) -I. $(filter %.c %.o,$^) -o $@ -lm
 resnet-spike: $(B)/resnet18.elf
 	bash -o pipefail -c '$(SPIKE) --isa=$(SPIKE_ISA) -m$(SPIKE_MEM) $(PK) $< | tee $(B)/spike_out.txt' \
 	  || { rc=$$?; echo "SPIKE EXITED rc=$$rc (137=killed/OOM, 1/2=pk trap or program exit)"; exit $$rc; }

@@ -21,14 +21,14 @@ Convention: [x] done, [~] in progress / running, [ ] not started. Tags: (measure
 - [ ] Makefile: stamp USE_AME / LLVM_OPT / ISA into $(B)/.flags and depend on it; make resnet18_llvm.mlir depend on mlir/conv_rewrite.py (stale .o gave wrong-backend risk)
 - [ ] tools/record.sh: run a build and append one JSON line (model, dir, backend, flags, git commit, RUN0/RUN1 counters, STATS, PASS) to results.jsonl; generate the results page DATA from it (no hand copying)
 - [ ] Scalar runs still missing: Whisper-tiny encoder; Whisper-small decoder step (cheap, ~1.2G instr; the 3 s encoder is done, 38.98x warm); Whisper-small encoder 30 s is NOT feasible (~1.2T instr, ~5 h), report as extrapolated from 7.0 instr/MAC; Moonshine-base when exported
-- [ ] Explain the Whisper-small encoder cold/warm gap (3.47G = 6.5%, all in non-matmul; hypothesis: first touch of the 12x1500x1500 attention score buffers) and decide whether results should always use RUN1 (RUNS=2); the 3 s encoder was re-run with 2 runs: cold gap 129.65M = 5.3%, same in AME and scalar
-- [ ] Re-run all models on ONE pipeline version (same commit, O3, counters off) so rows are comparable; retire the old ViT 12-layer 4953.64M number
+- [ ] Explain the Whisper-small encoder cold/warm gap (3.47G = 6.5% at 30 s, 129.65M = 5.3% at 3 s; all in non-matmul and identical in AME and scalar). The attention-score first-touch guess is doubtful: the score buffer is 100x smaller at 3 s (1.08 MB vs 108 MB) but the gap is only 26.8x smaller; other first-touch buffers or one-time init are more likely. Separate it with a PC histogram of RUN0 vs RUN1 (tools/pchist.py) and decide whether results should always use RUN1 (RUNS=2); the 3 s encoder was re-run with 2 runs: cold gap 129.65M = 5.3%, same in AME and scalar
+- [ ] Re-run all models on ONE pipeline version (same commit, O3, counters off): ViT 2- and 12-layer are done on the current pipeline; still to confirm for ResNet18, Whisper-tiny and Moonshine rows (record.sh will make this a one-liner); the old ViT 12-layer 4953.64M number is retired
 - [ ] Update the results page with the new scalar rows (Moonshine, ViT 2-layer, ViT 12-layer) and the 17.16x / 38.10x ratios
 - [ ] Investigate Moonshine MACs: ours 4.336G vs the teammate's 4.4026G (1.5%); find which ops the op-recorder counts that the matmul counter does not
-- [ ] Label everything: "scalar = naive C triple loop", "PASS = sampled check", "fp32 random weights, reduced configs" on the page and in STATE.md
+- [ ] Label everything: "scalar = plain C i-k-j loop, no blocking", "PASS = sampled check", "fp32 random weights, reduced configs" on the page and in STATE.md
 
 ## Next: medium (a day each)
-- [ ] Profile the non-matmul share (40-74% of AME forward): run tools/pchist.py on Moonshine-tiny and Whisper-tiny encoder; predict from shapes (expf/erff counts x ~40 instr, loop element counts) and compare to the histogram, as done for ViT
+- [ ] Profile the non-matmul share (39-74% of AME forward): run tools/pchist.py on Moonshine-tiny and Whisper-tiny encoder; predict from shapes (expf/erff counts x ~40 instr, loop element counts) and compare to the histogram, as done for ViT
 - [ ] Moonshine in_copy 88M (50 copies) vs 33M for the larger Whisper-small encoder: log shape and element count of every memrefCopy call
 - [ ] Fairer scalar baseline: (a) register-blocked scalar matmul, (b) RVV matmul (vfmacc; the Spike ISA already has v), compile the non-matmul code identically for each; report ratios against all baselines
 - [ ] Exact correctness mode in compare_tensor.py (all elements) for at least Moonshine-tiny and one ViT size

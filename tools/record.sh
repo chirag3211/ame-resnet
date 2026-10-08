@@ -23,7 +23,12 @@ ARGS=(); SETS=()
 for k in "${!V[@]}"; do ARGS+=("$k=${V[$k]}"); SETS+=(--set "$(echo "$k" | tr A-Z a-z)=${V[$k]}"); done
 LOG=$D/log_$BE.txt
 echo "make B=$D ${ARGS[*]} resnet-spike  ->  $LOG"
+echo "live log: tail -f $LOG   (this screen only shows RUN/STATS/PASS lines, so a long lowering looks silent)"
 T0=$(date +%s)
 make B="$D" "${ARGS[@]}" resnet-spike 2>&1 | grep -v LOGIT | tee "$LOG" | grep -E 'rror|RUN|STATS|max abs|PASS|FAIL'
 RC=${PIPESTATUS[0]}
+# a run that never printed a RUN line (build error, Ctrl-C, OOM) is not a result: keep the log, record nothing
+if ! grep -q '^RUN[0-9] INSTRET' "$LOG"; then
+  echo "no RUN lines in $LOG (make rc=$RC): the run did not finish. NOT recording. Last lines:"; tail -5 "$LOG"; exit $(( RC ? RC : 1 ))
+fi
 python3 tools/record.py "$LOG" --dir "$D" --backend "$BE" "${SETS[@]}" --wall $(( $(date +%s) - T0 )) --rc "$RC"

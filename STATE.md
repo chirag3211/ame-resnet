@@ -1,5 +1,5 @@
 # STATE (Oct 8 2026)  -- PyTorch -> torch-mlir -> RV64 -> riscv-stc Spike (AME matrix extension)
-Models so far: ResNet18 (224 and 64), ViT-B/16 (2-layer and full 12-layer), Whisper-tiny encoder + decoder step, Moonshine-tiny encoder. Scalar baselines done for ResNet18, Whisper-tiny decoder step, Moonshine-tiny, ViT 2-layer (see the scalar sections). Next steps and open work: TODO.md. Label convention below:
+Models so far: ResNet18 (224 and 64), ViT-B/16 (2-layer and full 12-layer), Whisper-tiny encoder + decoder step, Moonshine-tiny encoder, Whisper-small encoder (30 s and 3 s) + decoder step. Scalar baselines done for ResNet18, Whisper-tiny decoder step, Moonshine-tiny, ViT 2-layer and ViT 12-layer (see the scalar sections). Next steps and open work: TODO.md. Label convention below:
 **measured** = printed by the program, **derived** = arithmetic on measured numbers, **hypothesis** = not verified.
 
 ## Environment (WSL Ubuntu, user chirag; WSL RAM budget 15 GB, can go to 20 GB)
@@ -167,7 +167,27 @@ Dir build_vit2p, `make B=build_vit2p LLVM_OPT=O3 SPIKE_ISA=rv64gc_zicntr resnet-
 | everything else (derived) | 224.32M | 224.33M (224,326,426) |
 STATS backend=reference-scalar matmul_calls=58 macs=3,024,282,624 -> scalar matmul 7.009 instr/MAC. TOP1 829 (matches PyTorch), max abs err 3.636e-6 (identical to AME). RUN0-RUN1 gap 109.52M (same as the AME gap, 109.5M).
 AME vs scalar (derived): whole-forward 38.10x; matmul-only 62.74x. The AME column uses the 2-decimal-M figures recorded above, so ratios are good to ~4 digits.
-Not run yet: full 12-layer scalar and a 12-layer AME re-run on the current pipeline (see TODO.md; the 4953.64M number is the old build: original export, counters on, no O3, so it is NOT comparable with any scalar number measured now).
+Full 12-layer ViT on the current pipeline: see the next section.
+
+### ViT-B/16 12-layer, pre-transposed (build_vit12p), O3, counters off: AME and SCALAR (measured; ratios derived). This replaces the old 4953.64M number.
+Export `python3 python/export_vit.py 12` (-> build_vit12p), `ln -sf vit.mlir build_vit12p/resnet18.mlir`, both backends with LLVM_OPT=O3 (logs build_vit12p/log_ame.txt, log_scalar.txt).
+| | AME RUN0 | AME RUN1 | scalar RUN0 | scalar RUN1 |
+|---|---|---|---|---|
+| forward | 3,840,857,492 | **3,262,794,077** | 124,973,187,275 | **124,395,123,392** |
+| in_matmul | 2,392,567,965 | 1,960,347,135 | 123,524,897,280 | 123,092,676,450 |
+| in_copy | 0 | 0 | 0 | 0 |
+| everything else (derived) | | 1,302,446,942 | | 1,302,446,942 |
+STATS: matmul_calls=338, macs=17,563,828,224 (both backends). TOP1 272 = PyTorch in both; max abs err 4.888e-6 in both (identical). Derived: AME matmul 0.1116 instr/MAC, scalar matmul 7.008 instr/MAC; whole-forward 38.13x; matmul-only 62.79x; non-matmul = 39.9% of AME forward. "Everything else" is IDENTICAL in AME and scalar to the instruction (1,302,446,942). The earlier prediction for the scalar run (~124G per run, from 7.009 instr/MAC x 17.564G + ~1.3G) came within 0.1%.
+Cold/warm: gap 578.06M in both backends (AME 578,063,415; scalar 578,063,883), of which 432,220,830 sits in in_matmul in both (identical). Hypothesis: first touch of the inline weights (page faults) is counted inside the matmul calls and is backend independent. So RUN0/RUN0 ratios are comparable.
+Old build (original export, counters on, no O3) was 4953.64M AME; the current pipeline is 1.52x lower (3262.79M). The old number is retired; do not compare it with any scalar number.
+ViT layer scaling (derived): per-layer MACs (17,563.83M - 3,024.28M)/10 = 1,453.96M, equal to the hand count (197 x (4x768^2 + 2x768x3072) + 2x197^2x768 = 1,453.9M); fixed part 116.4M (patch embed 115.6M + head). Whole-forward ratio 38.10x at 2 layers and 38.13x at 12 layers. Two points cannot prove linearity; a 4-layer point is still open (TODO.md).
+
+### Whisper-small (AME only so far; warm RUN1 unless noted; measured, shares derived)
+Encoder 30 s (dir build_whisper_small_encpw, weights-as-args, SPIKE_MEM=8192, log run.log): RUN0 57,083,722,312, RUN1 **53,611,568,800**; in_matmul 19,031,629,026 (35.5%) in both runs; in_copy 33,133,266 (2 calls, 0.06%); everything else (derived) 34,546,806,508 (64.4%). STATS macs=172,081,152,000, matmul_calls=362 (12 layers x 30 + 2 convs). Matmul 0.1106 instr/MAC. PASS: max abs err (samples) 5.484e-6, |gold|max 4.56, sumsq rel err 6.89e-9, projection err 7.14e-7. Cold/warm gap 3,472,153,512 (6.5% of RUN1), entirely in the non-matmul part (matmul and copy are identical in RUN0 and RUN1). Hypothesis: first touch of the large activation buffers (attention scores 12 heads x 1500^2 x 4 B). So a RUN0-only result can overstate by several percent here.
+Encoder 3 s (build_whisper_small_enc300pw, 300 mel frames = 150 positions; single run, RUN0/cold only): forward 2,577,476,237; in_matmul 1,500,225,642 (58.2%); in_copy 3,368,466 (2 calls); everything else (derived) 1,073,882,129 (41.7%). macs=13,475,635,200, matmul_calls=362, 0.1113 instr/MAC. PASS: max abs err (samples) 4.768e-6, sumsq 1.42e-8, projection 1.19e-6. Do NOT extrapolate this to 30 s: attention is 3.1% of MACs at 150 positions and 24.1% at 1500 (derived), and softmax work grows with length^2 (non-matmul share 41.7% at 3 s vs 64.4% at 30 s).
+Decoder step (build_whisper_small_dec32pw, 32 cached tokens, 1500 encoder frames, weights-as-args): RUN0 181,302,052, RUN1 **176,884,705**; in_matmul 147,447,393 (83.4%, identical in both runs); in_copy RUN1 4,811,304 (48 calls, 2.7%); everything else (derived) 24,626,008 (13.9%). STATS macs=167,179,008, matmul_calls=673 = 12 x 8 linears + head + 12 layers x 12 heads x 4 attention matmuls. Hand count matches exactly: linears 138,922,752 (head 39,832,320 = 23.8%) + attention 28,256,256 (33 positions self, 1500 cross). Matmul 0.882 instr/MAC (M=1 tile waste; Whisper-tiny step 0.885). Compare (re-run on spike_out.txt, python/compare_tensor.py): PASS, max abs err (samples) 3.666e-6, |gold|max 2.35, sumsq 2.28e-8, projection 4.56e-7.
+MAC cross-check with the teammate: Whisper-small encoder 30 s hand count and STATS both give 172,081,152,000 = his 172.0812 GMAC (exact).
+Scalar baselines NOT run for Whisper-small. Predictions from the constant ~7.0 instr/MAC (hypothesis, to be checked): decoder step ~6.8x whole-forward; encoder 3 s ~37x (cold/cold); encoder 30 s ~23x (172G MACs x 7.0 = ~1.2T instr, about 5 hours per run at 70M instr/s, so not run; report as extrapolated, never as measured).
 
 ### Summary of AME vs scalar ratios so far (warm RUN1, derived)
 | Workload | whole-forward | matmul-only | scalar matmul instr/MAC | non-matmul share of AME forward |
@@ -176,9 +196,13 @@ Not run yet: full 12-layer scalar and a 12-layer AME re-run on the current pipel
 | ResNet18 64 | 35.43x | 66.83x | ~7.0 | 47.7% |
 | ViT-B/16 2-layer pre-transposed | 38.10x | 62.74x | 7.009 | 39.9% |
 | Moonshine-tiny enc 10 s | 17.16x | 63.31x | 7.028 | 74.1% (copy 4.8% + other 69.3%) |
+| ViT-B/16 12-layer pre-transposed | 38.13x | 62.79x | 7.008 | 39.9% |
 | Whisper-tiny dec step | 6.9x | 7.9x | 7.01 | 14.7% (matmul 0.885 instr/MAC, M=1) |
 | Whisper-tiny enc 30 s | not run (scalar) | | | 73.9% |
-Reading (derived/hypothesis): the matmul ratio is ~63x for every large-M workload because it is set by the kernel (one mfma = 128 MACs per ~14-instr K-step vs ~7 instr/MAC scalar), not by the model. The whole-forward ratio is set by the non-matmul share, which stays on the scalar core in both builds (identical "everything else" in every pair that was checked). Decode steps (M=1) use 1 of 8 tile rows, so even the matmul ratio is only 7.9x.
+| Whisper-small enc 30 s | not run (predicted ~23x, hypothesis) | | | 64.4% |
+| Whisper-small enc 3 s (RUN0 cold) | not run (predicted ~37x, hypothesis) | | | 41.8% |
+| Whisper-small dec step | not run (predicted ~6.8x, hypothesis) | | | 16.6% (copy 2.7% + other 13.9%) |
+Reading (derived/hypothesis): the matmul ratio is ~63x for every large-M workload because it is set by the kernel (one mfma = 128 MACs per ~14-instr K-step vs ~7 instr/MAC scalar), not by the model. The whole-forward ratio is set by the non-matmul share, which stays on the scalar core in both builds (identical "everything else" in every pair that was checked). The non-matmul share depends on sequence length (Whisper-small encoder: 41.8% at 3 s, 64.4% at 30 s) and falls as d grows (Whisper-tiny 30 s 73.9% vs Whisper-small 30 s 64.4%; hypothesis: matmul work scales ~d^2, elementwise ~d). Decode steps (M=1) use 1 of 8 tile rows, so even the matmul ratio is only 7.9x.
 
 ## fp16 on AME: findings (Oct 8 2026; investigated, NOT ported; the whole pipeline is still fp32)
 Question asked: can the pipeline be run in fp16 (the teammate's workload study used fp16 shapes)? Answer so far: the instruction exists, but the accumulator is fp16, so a straight port is not numerically usable for long K.
@@ -195,7 +219,7 @@ Question asked: can the pipeline be run in fp16 (the teammate's workload study u
 ## Relation to the teammate's workload study (Workload_Characterization.html; Oct 8)
 - His page is STATIC: it records every PyTorch op with exact shapes on the meta device (no weights), fp16, batch 1, TorchDispatchMode, and reports MACs, bytes (inputs + outputs per op, no cache reuse, upper bound), intensity. Exception: Kokoro runs with real weights in fp32. Nothing else on the page is stated to differ.
 - This repo is MEASURED: retired instructions on Spike, fp32, seeded random weights, reduced-layer or custom export graphs in places (pre-transposed ViT, hand-written Whisper decoder step). So his bytes and intensity are NOT comparable with anything computed from fp32 tensors here (2x bytes); his MACs ARE comparable (precision independent).
-- MAC cross-check: ViT-B/16 17.5638 GMAC (his) vs 17.564G (STATS, this repo): match. Moonshine tiny encoder 4.4026 GMAC (his, 10 s) vs 4.336G (STATS): ours is 1.5% lower; cause not investigated (hypothesis: small non-matmul-counted ops, e.g. the rotary, pooling or other ops his op-recorder counts). Whisper-tiny and ResNet18 are not on his page; ResNet-50 is (4.0892 GMAC) and is skipped here.
+- MAC cross-check: ViT-B/16 17.5638 GMAC (his) vs 17.564G (STATS, build_vit12p): match. Whisper-small encoder 30 s 172.0812 GMAC (his) vs 172,081,152,000 (STATS and hand count): exact. Moonshine tiny encoder 4.4026 GMAC (his, 10 s) vs 4.336G (STATS): ours is 1.5% lower; cause not investigated (hypothesis: small non-matmul-counted ops, e.g. the rotary, pooling or other ops his op-recorder counts). Whisper-tiny, Whisper-small decoder step and ResNet18 are not on his page as run here; ResNet-50 is (4.0892 GMAC) and is skipped here.
 - Agreement: his decode steps have intensity <= 0.8 FLOP/B (memory-bound); here the Whisper-tiny decode step gets only 6.9x whole-forward and 0.885 instr/MAC for matmul (M=1). His non-MAC byte shares (softmax, norm, elementwise, data movement) correspond to the scalar-core work that is 40-74% of AME forward instructions here.
 - Results page for this repo, in his style (same layout, tokens, filters): AME_Measured_Results.html (generated outside the repo; built from the numbers in this file; needs the new scalar rows added, see TODO.md).
 
@@ -234,4 +258,4 @@ Generated code is one function, so look at the hottest 128-byte blocks and `risc
 - ResNet18 is the baseline; ResNet-50 skipped (coverage argument). ViT-B/16 done at full size.
 - fp32 fits 15 GB: Moonshine, Kokoro, Whisper small and large-v3-turbo; Canary-Qwen borderline at 20 GB. The 3B+ LLMs do not fit in fp32; use reduced-layer random-weight configs (2 layers, same widths) and label them as such; extrapolating by layer count is a hypothesis.
 - Mamba (e.g. mamba-130m) planned for coverage: projections are matmuls, the selective scan and depthwise causal conv are not covered yet.
-- Done (AME): ResNet18, ViT-B/16, Whisper-tiny encoder + decoder step, Moonshine-tiny encoder (10 s). Done (scalar too): ResNet18, Whisper-tiny decoder step, Moonshine-tiny, ViT 2-layer. Whisper-small was running as of the last commit (not recorded here yet). Next: Whisper decoder step (KV cache + cross-attention), weights-as-function-arguments loaded from a file (needed for Whisper-small and up), Moonshine-base, then reduced-config LLMs (prefill 128/512/2048, decode 512/2048). Consider a fused softmax for long-sequence attention.
+- Done (AME): ResNet18, ViT-B/16, Whisper-tiny encoder + decoder step, Moonshine-tiny encoder (10 s). Done (scalar too): ResNet18, Whisper-tiny decoder step, Moonshine-tiny, ViT 2-layer. Whisper-small encoder (30 s, 3 s) and decoder step are done on AME (see the Whisper-small section); scalar not run. Next: Whisper decoder step (KV cache + cross-attention), weights-as-function-arguments loaded from a file (needed for Whisper-small and up), Moonshine-base, then reduced-config LLMs (prefill 128/512/2048, decode 512/2048). Consider a fused softmax for long-sequence attention.

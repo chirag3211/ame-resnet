@@ -4,7 +4,8 @@ usage: results_table.py [results.jsonl] [--json] [--all]
 Prints a markdown table (warm RUN1 unless a dir has only RUN0) and sanity warnings:
   - 'everything else' (forward - in_matmul - in_copy) must be IDENTICAL in the AME and scalar run of one dir
     (it is in every pair checked so far); a mismatch means the two runs used different pipelines/drivers.
-  - different git commits, dirty trees, or different LLVM_OPT between the two runs.
+  - different git commits, dirty trees, or different LLVM_OPT between the two runs. Backfilled records (old logs
+    ingested with record.py --backfill) have git_commit = null: the pair is reported as 'commit unknown', not as equal.
 Columns: whole = scalar/AME forward; matmul = scalar/AME in_matmul; n = non-matmul share of the AME forward
 (copy included); check = n + R(1-n) from the identity in STATE.md (should equal whole)."""
 import json, sys
@@ -47,15 +48,21 @@ def main():
             if ra["everything_else"] != rs["everything_else"] or ra["in_copy"] != rs["in_copy"]:
                 warns.append(f"{d}: 'everything else' differs AME {ra['everything_else']} vs scalar {rs['everything_else']} "
                              f"(copy {ra['in_copy']} vs {rs['in_copy']}): different pipeline/driver?")
-            if a.get("git_commit") != s.get("git_commit"): warns.append(f"{d}: AME commit {a.get('git_commit')} != scalar {s.get('git_commit')}")
+            ca, cs = a.get("git_commit"), s.get("git_commit")
+            if ca is None or cs is None:
+                warns.append(f"{d}: commit unknown for {' and '.join(r['backend'] for r in (a, s) if r.get('git_commit') is None)} "
+                             f"(backfilled log): cannot confirm one pipeline version")
+            elif ca != cs: warns.append(f"{d}: AME commit {ca} != scalar {cs}")
             if a.get("flags", {}).get("llvm_opt") != s.get("flags", {}).get("llvm_opt"): warns.append(f"{d}: LLVM_OPT differs between the AME and scalar runs")
             if ns != na: warns.append(f"{d}: AME used RUN{na}, scalar RUN{ns}")
             row["whole"] = rs["forward"] / ra["forward"]; row["matmul"] = rs["in_matmul"] / ra["in_matmul"]
             row["check"] = row["n"] + row["matmul"] * (1 - row["n"])
             r0a, r0s = run(a, "0"), run(s, "0")
-            if r0a and r0s: row["cold"] = r0s["forward"] / r0a["forward"]
+            if r0a and r0s:
+                row["cold"] = r0s["forward"] / r0a["forward"]
+                row["cold_gap_share"] = (r0a["forward"] - ra["forward"]) / r0a["forward"] if na == "1" else None
         for r in (a, s):
-            if r and r.get("git_dirty"): warns.append(f"{d}: {r['backend']} record made on a dirty git tree")
+            if r and r.get("git_dirty") is True: warns.append(f"{d}: {r['backend']} record made on a dirty git tree")
         rows.append(row)
     if "--json" in sys.argv:
         print(json.dumps(rows, indent=1)); return
@@ -65,7 +72,10 @@ def main():
     for r in rows:
         print(f"| {r['model']} | {f(r.get('ame_forward'), ',')} | {f(r.get('scalar_forward'), ',')} | {f(r.get('whole'), '.2f')}x "
               f"| {f(r.get('matmul'), '.2f')}x | {f(r.get('n') and r['n'] * 100, '.1f')}% | {f(r.get('check'), '.2f')}x "
-              f"| {f(r.get('cold'), '.2f')}x | {f(r.get('scalar_instr_per_mac'), '.3f')} |")
+              f"| {f(r.get('cold'), '.2f')}x{'*' if (r.get('cold_gap_share') or 0) > 0.2 else ''} | {f(r.get('scalar_instr_per_mac'), '.3f')} |")
+    if any((r.get("cold_gap_share") or 0) > 0.2 for r in rows):
+        print("\n\\* cold/cold: more than 20% of the AME RUN0 is one-time first-touch (same in both backends), so it is "
+              "not a speedup metric; use the warm 'whole' column.")
     for w in warns: print("WARNING:", w, file=sys.stderr)
 
 if __name__ == "__main__": main()

@@ -12,7 +12,7 @@ Convention: [x] done, [~] in progress / running, [ ] not started. Tags: (measure
 - [x] Compared with the teammate's study: precision (fp16 shapes vs fp32 here), MAC cross-check (ViT matches, Moonshine 1.5% lower)
 - [x] Results page in the teammate's style (AME_Measured_Results.html)
 
-- [x] Whisper-small: encoder 30 s (AME, 53.61G, 64.4% non-matmul), encoder 3 s (AME, RUN0 only), decoder step (AME, 176.88M, PASS); MACs match the teammate's 172.0812 G exactly
+- [x] Whisper-small: encoder 30 s (AME, 53.61G, 64.4% non-matmul), encoder 3 s (AME + scalar, 2 runs, 38.98x warm / 37.07x cold), decoder step (AME, 176.88M, PASS); MACs match the teammate's 172.0812 G exactly
 
 ## In progress
 - (nothing running as of the last results; check `pgrep -a spike`)
@@ -20,8 +20,8 @@ Convention: [x] done, [~] in progress / running, [ ] not started. Tags: (measure
 ## Next: easy (hours)
 - [ ] Makefile: stamp USE_AME / LLVM_OPT / ISA into $(B)/.flags and depend on it; make resnet18_llvm.mlir depend on mlir/conv_rewrite.py (stale .o gave wrong-backend risk)
 - [ ] tools/record.sh: run a build and append one JSON line (model, dir, backend, flags, git commit, RUN0/RUN1 counters, STATS, PASS) to results.jsonl; generate the results page DATA from it (no hand copying)
-- [ ] Scalar runs still missing: Whisper-tiny encoder; Whisper-small decoder step (cheap, ~1.2G instr) and Whisper-small encoder 3 s (~95G instr, ~25 min, single cold run); Whisper-small encoder 30 s is NOT feasible (~1.2T instr, ~5 h), report as extrapolated from 7.0 instr/MAC; Moonshine-base when exported
-- [ ] Explain the Whisper-small encoder cold/warm gap (3.47G = 6.5%, all in non-matmul; hypothesis: first touch of the 12x1500x1500 attention score buffers) and decide whether results should always use RUN1 (RUNS=2); the enc300pw result is RUN0 only
+- [ ] Scalar runs still missing: Whisper-tiny encoder; Whisper-small decoder step (cheap, ~1.2G instr; the 3 s encoder is done, 38.98x warm); Whisper-small encoder 30 s is NOT feasible (~1.2T instr, ~5 h), report as extrapolated from 7.0 instr/MAC; Moonshine-base when exported
+- [ ] Explain the Whisper-small encoder cold/warm gap (3.47G = 6.5%, all in non-matmul; hypothesis: first touch of the 12x1500x1500 attention score buffers) and decide whether results should always use RUN1 (RUNS=2); the 3 s encoder was re-run with 2 runs: cold gap 129.65M = 5.3%, same in AME and scalar
 - [ ] Re-run all models on ONE pipeline version (same commit, O3, counters off) so rows are comparable; retire the old ViT 12-layer 4953.64M number
 - [ ] Update the results page with the new scalar rows (Moonshine, ViT 2-layer, ViT 12-layer) and the 17.16x / 38.10x ratios
 - [ ] Investigate Moonshine MACs: ours 4.336G vs the teammate's 4.4026G (1.5%); find which ops the op-recorder counts that the matmul counter does not

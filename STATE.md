@@ -217,6 +217,70 @@ Scalar baselines for Whisper-small: encoder 3 s and decoder step measured (above
 | Whisper-small dec step | 6.80x | 7.95x | 7.015 | 16.6% (copy 2.7% + other 13.9%) |
 Reading (derived/hypothesis): the matmul ratio is ~63x for every large-M workload because it is set by the kernel (one mfma = 128 MACs per ~14-instr K-step vs ~7 instr/MAC scalar), not by the model. The whole-forward ratio is set by the non-matmul share, which stays on the scalar core in both builds (identical "everything else" in every pair that was checked). The non-matmul share depends on sequence length (Whisper-small encoder: 38.7% at 3 s, 64.5% at 30 s, copies included) and falls as d grows (Whisper-tiny 30 s 73.8% vs Whisper-small 30 s 64.5%; hypothesis: matmul work scales ~d^2, elementwise ~d). Decode steps (M=1) use 1 of 8 tile rows, so even the matmul ratio is only 7.9x. Exact identity (derived, valid because the non-matmul work is identical in both builds): whole-forward ratio = n + R x (1 - n), with n = non-matmul share of the AME forward and R = matmul-only ratio. It reproduces every measured pair: ResNet18 224 34.64x, ViT 12-layer 38.12x (measured 38.13x), Moonshine 17.16x, Whisper-tiny encoder 17.28x, Whisper-small 3 s 38.98x, decoder steps 6.9x and 6.80x. So given R (set by the kernels: ~63 for large M, ~7.9 for M=1) the model-level ratio depends only on n. This is an accounting identity, not an independent model or result: its use is that n comes cheaply from one AME run and R from the kernel, so the scalar ratio can be estimated without a scalar run (as done for the Whisper-small 30 s encoder, extrapolated).
 
+## ResNet18-64 scalar matmul overhead (derived, Oct 8)
+The scalar matmul ratio at SIZE=64 is 66.85x (7.527 instr/MAC) vs 63.09x (7.043 instr/MAC) at SIZE=224.
+The cause is loop overhead in the i-k-j scalar kernel (`ref_matmul.c`) at small spatial output sizes.
+
+After `conv_rewrite.py` the shape of each matmul is `[F, C*KH*KW] @ [C*KH*KW, OH*OW]`, where N = OH*OW
+is the number of spatial positions.  At SIZE=64 the spatial dimensions shrink with the input, so the deeper
+layers produce very small N.  Enumerating all ResNet18 matmul shapes:
+
+| SIZE | MACs in small-N shapes (N < 64) | share | blended instr/MAC |
+|---|---|---|---|
+| 64 | 67.1M of 148.6M | 45.2% | 7.527 (measured) |
+| 224 | 411M of 1814M | 22.7% | 7.043 (measured) |
+
+Solving for the implied cost of the small-N shapes, assuming large-N costs 7.0 instr/MAC:
+  `small_N_cost ≈ 8.17 instr/MAC` at SIZE=64, `≈ 7.19` at SIZE=224.
+
+The extra ~1.2 instr/MAC on small-N shapes is consistent with j-loop overhead in the inner loop: for N=64
+the loop-exit branch is ~1/64 of iterations, but at N=4 (the deepest 2×2 feature maps at SIZE=64) it is 25%.
+The outer i and k loops also carry proportionally more overhead when M and K are small.
+
+No fix is needed for this: the scalar kernel is intentionally unblocked.  The 66.85x matmul ratio at SIZE=64
+is a real measurement; it reflects higher scalar cost at small shapes, not an AME regression.
+(Also: at SIZE=64 the 1×1 downsample shortcuts produce N as small as 4, which do not appear at SIZE=224.)
+
+## Moonshine MACs discrepancy (confirmed, Oct 8)
+STATS reports 4,336,487,440 MACs; the teammate's workload study reports 4.4026 GMAC (diff 66.1M, 1.5%).
+
+**python/probe_moonshine_macs.py** (TorchDispatchMode, intercepting aten ops) initially reported only
+3,510,365,200 MACs — missing 826,122,240 = 6 layers × 4 projections × 415×288×288. The probe had a bug:
+`nn.Linear` on a 3D input `[1, 415, 288]` WITHOUT bias dispatches as `aten.matmul.default` (not `aten.mm`
+or `aten.addmm`), which was not checked. The 4 attention projections (Q, K, V, O) all have no bias and are
+called on 3D inputs, so all 24 per-layer projection calls were silently dropped.
+
+After fixing the probe to also intercept `aten.matmul.default`: probe total = STATS = 4,336,487,440. ✓
+
+The remaining discrepancy with the teammate (66.1M, 1.5%) does NOT factor cleanly by any architectural
+dimension and is not from attention projections, SwiGLU (would be 826M), one extra attention layer (99M),
+rotary apply (~425K), or depthwise convs.  ViT matches near-exactly; the miss is Moonshine-specific.
+Open: compare the teammate's per-op table against the probe's 136-call list to find the exact uncounted ops.
+
+**Probe op breakdown** (correct, after fix):
+- addmm (fc1, fc2): 1,652,244,480 MACs across 6 layers (note: these are the FFN projections WITH bias)
+- convolution: 1,262,904,480 MACs (3 audio conv stages)
+- bmm: 595,216,240 MACs (attention QK^T and AV, 6 layers × 8 heads × 2)
+- matmul (Q,K,V,O projections, no bias): 826,122,240 MACs (added by the fix)
+- rotary: 6,640 MACs
+The distinction between addmm (FFN, WITH bias) and matmul (projections, NO bias) is what caused the miss.
+
+## Cold/warm gap: CONFIRMED pk page-fault handler (Oct 8)
+Measured via pchist.py on 1-run (cold) and 2-run (warm) Moonshine-tiny encoder AME builds.
+
+**Finding: 99.1% of the cold/warm gap lives in the unmapped (pk/kernel) region.**
+Mapped function counts (2×cold vs combined, where combined-cold = warm):
+- Every user-space symbol shows almost exactly 2×: forward, ame_hw_matmul_f32, expf, erff, expm1f,
+  memmove, memrefCopy, memcpy, tanhf, memset — all within 0.4% of a 2.0× ratio.
+- The only exceptions contribute < 2M total (memmove 318K, memcpy 196K, memset 149K, main 1.3M).
+- Unmapped gap: 2 × 232,497,393 − 232,797,087 = **232,197,699** (99.1% of histogram total gap 234M).
+
+The unmapped region is the pk page-fault handler.  This confirms: the 218M cold/warm gap is caused by
+OS-level page fault handling on first touch of the inline weight constants in the MLIR-compiled `.elf`,
+not by any difference in computation between RUN0 and RUN1.  The gap is identical in AME and scalar builds
+because both touch the same weight pages.  Using `--weights-as-args` eliminates this gap (verified on the
+Whisper-tiny decoder: RUN0-RUN1 gap fell from 142M to 0.8M because weights are fread() before timing).
+
 ## fp16 on AME: findings (Oct 8 2026; investigated, NOT ported; the whole pipeline is still fp32)
 Question asked: can the pipeline be run in fp16 (the teammate's workload study used fp16 shapes)? Answer so far: the instruction exists, but the accumulator is fp16, so a straight port is not numerically usable for long K.
 - **Spec** (~/work/riscv-matrix-spec): e16 loads/stores/moves exist (mlae16.m, mlbe16.m, mlce16.m, msce16.m ...); ext-type.adoc:548 says e16 load/store/move are used for FP16 data, :600 for BF16, :181 for int16. The spec's e16 matmul examples store the C tile with 16-bit element stores (stride n*2).

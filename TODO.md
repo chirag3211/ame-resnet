@@ -21,14 +21,36 @@ Convention: [x] done, [~] in progress / running, [ ] not started. Tags: (measure
 - (nothing running as of the last results; check `pgrep -a spike`)
 
 ## Next: easy (hours)
-- [~] Makefile flag stamps: exercised by 13 real builds (USE_AME toggle works: every scalar run reported reference-scalar, every AME run AME; counts reproduced). Still to confirm: that a USE_AME toggle does NOT re-run opt/llc (grep the build logs, or `make -n` after a toggle) and that wall times of the first build in each pair are lowering, not Spike
+- [x] Makefile flag stamps: confirmed analytically (Oct 8). `resnet18.o` depends on `$(B)/.flags_cg`
+  which tracks only `LLVM_OPT / LLVM_OPT_BIN / LLC / ARCH / ABI`; `USE_AME` is NOT in
+  `CG_FLAGS`, so toggling it changes only `.flags_link`, which triggers a C recompile + relink
+  but NOT opt or llc. Verified by the 13 real builds: wall times of first-build scalar runs
+  were 26-99 s (consistent with C-only work, not a re-run of the slow llc step).
 - [ ] Scalar runs: all done except Whisper-small encoder 30 s (infeasible, ~5 h per run; stays extrapolated at ~23x, 23.0-23.2 depending on R). Moonshine-base when exported
-- [ ] Explain the Whisper-small encoder cold/warm gap (3.47G = 6.5% at 30 s, 129.65M = 5.3% at 3 s; all in non-matmul and identical in AME and scalar). The attention-score first-touch guess is doubtful: the score buffer is 100x smaller at 3 s (1.08 MB vs 108 MB) but the gap is only 26.8x smaller; other first-touch buffers or one-time init are more likely. Oct 8 data sharpens it: the gap is entirely non-matmul and non-copy for the weights-as-args Whisper-small encoders (matmul and copy identical in RUN0 and RUN1), and mostly non-matmul for Whisper-tiny encoder (643M gap, 38M in matmul), Moonshine (218M, 38M) and ViT-2 (110M, 78M). Separate it with a PC histogram of RUN0 vs RUN1 (tools/pchist.py) and decide whether results should always use RUN1 (RUNS=2); the 3 s encoder was re-run with 2 runs: cold gap 129.65M = 5.3%, same in AME and scalar
+- [x] Explain the cold/warm gap. CONFIRMED via pchist.py on Moonshine-tiny AME (1-run cold vs 2-run combined):
+  99.1% of the 218M gap is in the unmapped (pk/kernel) region = OS page-fault handler on first-touch of
+  inline weight constants. Every user-space symbol (forward, ame_hw, expf, erff, ...) shows a ratio within
+  0.4% of 2.0× between the two runs — no computation-level difference at all. The --weights-as-args path
+  eliminates the gap by moving first-touch into fread() before the rdinstret window. See STATE.md.
+  The Whisper-small 30 s gap (3.47G) and 3 s gap (129.65M) are both non-matmul and non-copy (same in both
+  backends), consistent with the same cause at different weight-set sizes.
 - [~] Re-run all models on ONE pipeline version (same commit, O3, counters off): re-run and reproduced on Oct 8: ResNet18 64/224, ViT 2-layer, Moonshine, both decoder steps, Whisper-tiny encoder AME. Still backfilled (commit unknown, so results_table.py warns): vit12p (ame+scalar), Whisper-small 3 s (ame+scalar), Whisper-tiny encoder scalar, Whisper-small 30 s (ame). Re-run them with tools/record.sh if a recorded commit is wanted (vit12p scalar ~125G instr, Whisper-small 3 s scalar ~95G; hours at ~70M instr/s); the 30 s encoder AME run is long on matrix Spike. The old ViT 12-layer 4953.64M number is retired
 - [ ] Regenerate the results page from results.jsonl (unblocked: `python3 tools/results_table.py --json`; the page was updated by hand on Oct 8 with every row measured so far: ViT 2- and 12-layer, Moonshine, Whisper-tiny encoder 17.28x, Whisper-small 3 s 38.98x and decoder step 6.80x, Whisper-small 30 s AME only)
-- [ ] ResNet18 64 scalar matmul costs 7.527 instr/MAC vs 7.0-7.04 everywhere else (it sets the 66.85x matmul ratio at 64). Cause not isolated (hypothesis: small matmul shapes / loop overhead); a one-line note is in STATE.md, low priority
-- [ ] Make a record.py test (stub log -> row; --backfill gives null commit/dirty/ts; refuses backend mismatch)
-- [ ] Investigate Moonshine MACs: ours 4.336G vs the teammate's 4.4026G (1.5%); find which ops the op-recorder counts that the matmul counter does not
+- [x] ResNet18 64 scalar matmul costs 7.527 instr/MAC vs 7.0-7.04 everywhere else. EXPLAINED (see STATE.md
+  'ResNet18-64 scalar overhead'): at SIZE=64, 45.2% of MACs are in shapes with small N (spatial positions < 64),
+  which cost ~8.2 instr/MAC due to j-loop overhead in the i-k-j scalar kernel. At SIZE=224 only 22.7% of MACs
+  are in small-N shapes, so the blended rate is close to 7.0. No fix needed (the scalar kernel is intentionally
+  simple); the 66.85x matmul ratio at 64 reflects the higher scalar cost, not an AME regression.
+- [x] record.py tests: tests/test_record.py, 20 tests (11 parse unit + 9 subprocess integration).
+  Covers: happy path AME/scalar, --backfill null provenance, --git-commit with --backfill, backend
+  mismatch in both directions, FAIL log exits 1 but row is written, multiple appends, --wall.
+  Run: `python3 tests/test_record.py` or `python3 -m pytest tests/test_record.py`.
+- [~] Moonshine MACs: ours 4.336G vs the teammate's 4.4026G (1.5%, 66.1M unexplained).
+  probe_moonshine_macs.py confirmed our STATS is correct after fixing a bug (missed aten.matmul.default,
+  which is what nn.Linear uses for 3D inputs without bias — the 4 attention projections per layer).
+  Fixed probe = STATS = 4,336,487,440. The teammate's 66.1M gap is not the projections (826M), not
+  an attention layer (99M), not depthwise/rotary. Still open: compare the teammate's per-op table to
+  isolate it. ViT matches near-exactly so the miss is Moonshine-specific.
 - [ ] Label everything: "scalar = plain C i-k-j loop, no blocking", "PASS = sampled check", "fp32 random weights, reduced configs" on the page and in STATE.md
 
 ## Next: medium (a day each)
